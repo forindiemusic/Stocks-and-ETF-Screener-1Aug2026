@@ -1,0 +1,137 @@
+# ETF Swing Trading Agent Configuration
+
+# Universe of ETFs to evaluate (broad market, sectors, factors, themes)
+etf_universe:
+  # Broad Market
+  - SPY   # S&P 500
+  - VOO   # S&P 500 (lower fee)
+  - QQQ   # Nasdaq 100
+  - DIA   # Dow Jones
+  - IWM   # Russell 2000
+  - VTI   # Total Stock Market
+  - FELC  # Fidelity Large Cap Core (custom - large cap blend)
+  - FHEQ  # Fidelity High Equity Quality (custom - quality growth)
+  - ITOT  # iShares Core S&P Total U.S. Stock Market ETF
+  
+  # Sectors
+  - XLK   # Technology
+  - XLF   # Financials
+  - XLV   # Healthcare
+  - XLE   # Energy
+  - XLI   # Industrials
+  - XLP   # Consumer Staples
+  - XLY   # Consumer Discretionary
+  - XLB   # Materials
+  - XLU   # Utilities
+  - XLRE  # Real Estate
+  - XLC   # Communication Services
+  - XMAG  # Mega Cap Growth (custom - Mag 7)
+  - JETS  # Jet ETF (custom - airline sector)
+  - NANC  # Democratic Trading ETF
+  - GOP   # Republican Trading ETF
+  - IQQ   # Nasdaq 100
+  
+  # Factors / Smart Beta
+  - USMV  # Minimum Volatility
+  - MTUM  # Momentum
+  - QUAL  # Quality
+  - VLUE  # Value
+  - SUSA  # ESG
+  - SPHD  # High Dividend Low Vol
+  
+  # Thematic / International
+  - ARKK  # Innovation (high beta)
+  - ICVT  # Convertible Bonds
+  - EMB   # Emerging Markets Bonds
+  - VWO   # Emerging Markets Equity
+  - VEA   # Developed International
+  - IXUS  # Total International Stock
+  - VGK   # Europe
+  - EWJ   # Japan
+  - EWG   # Germany
+  - EWY   # South Korea
+  - IEMG  # Emerging Markets
+
+# Market Regime Detection
+market_regime:
+  spy_symbol: "SPY"
+  lookback_days: 200
+  trend_threshold: 0.02      # 2% above/below SMA200 for bull/bear
+  volatility_lookback: 20
+  vix_symbol: "^VIX"
+  vix_high_threshold: 30
+  vix_low_threshold: 15
+
+# Technical Scoring Weights (must sum to 1.0)
+technical_weights:
+  trend_score: 0.30          # Price vs SMA50/200, ADX
+  momentum_score: 0.25       # RSI, ROC, MACD
+  mean_reversion_score: 0.20 # Bollinger Bands, distance from mean
+  volume_score: 0.15         # Volume trend, OBV
+  volatility_score: 0.10     # ATR, realized vol vs historical
+
+# Fundamental / Factor Scoring
+fundamental_weights:
+  expense_ratio: 0.20        # Lower is better
+  liquidity: 0.20            # Avg volume, bid-ask spread
+  tracking_error: 0.15       # vs benchmark
+  aum: 0.15                  # Assets under management
+  yield: 0.15                # Dividend yield
+  sharpe_1y: 0.15            # Risk-adjusted return
+
+# News Sentiment
+news:
+  enabled: true
+  lookback_days: 7
+  rate_limit_per_sec: 0.5    # Max 1 request per 2 seconds to avoid rate limiting
+  sources:
+    - "finance.yahoo.com"
+    - "marketwatch.com"
+    - "reuters.com"
+    - "bloomberg.com"
+    - "cnbc.com"
+  sentiment_weight: 0.20     # Weight in final composite score (matches composite_weights)
+
+# Risk Management
+risk:
+  max_position_pct: 0.20     # Max 20% per ETF
+  min_score_threshold: 0.55  # Minimum composite score to recommend (soft fallback to top N)
+  stop_loss_atr_mult: 2.0    # Stop loss = entry - 2*ATR
+  take_profit_atr_mult: 3.0  # Take profit = entry + 3*ATR
+  max_correlated_positions: 3 # Max positions with >0.7 correlation
+
+# Output
+output:
+  top_n: 5
+  show_details: true
+  # export_csv and csv_path are used by the backtester, not by main()
+  export_csv: true
+  csv_path: "./output/etf_signals.csv"
+  max_workers: 8             # Parallel threads for ETF evaluation (I/O-bound)
+
+# Composite score weights (shared by agent and backtester for consistency)
+composite_weights:
+  technical: 0.50
+  fundamental: 0.30
+  sentiment: 0.20
+
+# Backtesting Configuration
+backtest:
+  # Transaction costs (applied per rebalance on turnover)
+  commission_per_share: 0.0      # Per-share commission ($0 for most modern brokers)
+  slippage_bps: 5.0              # Slippage in basis points (0.05% = 5 bps)
+  bid_ask_spread_bps: 3.0        # Estimated half-spread cost in bps
+  # Convenience override: if > 0, uses this single value instead of summing above
+  total_txn_cost_bps: 8.0        # Total one-way transaction cost in bps (0.08%)
+  
+  # Composite score weights for backtest (should match agent's effective weights)
+  composite_weights:
+    technical: 0.50
+    fundamental: 0.30
+    sentiment: 0.20
+  
+  # Benchmark symbol
+  benchmark_symbol: "SPY"
+  
+  # Number of top ETFs to hold
+  top_n: 5

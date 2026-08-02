@@ -1,0 +1,29 @@
+# Development dependencies - pinned for reproducible builds
+# Install with: pip install -r requirements-dev.txt
+
+# Testing
+pytest==8.0.2
+pytest-cov==4.1.0
+pytest-asyncio==0.23.3
+pytest-mock==3.12.1
+hypothesis==6.92.8
+
+# Code quality
+black==24.4.2
+ruff==0.3.7
+mypy==1.8.0
+types-requests==2.31.0.20240416
+types-pyyaml==6.0.12.12
+pre-commit==3.6.0
+pip-audit==2.7.1
+bandit==1.7.8
+pydocstyle==6.3.0
+
+# Optional: for backtesting visualization
+# matplotlib==3.8.3
+# seaborn==0.13.2
+# empyrical==0.5.5
+
+# Optional: for dashboard
+# streamlit==1.31.1
+# plotly==5.18.0

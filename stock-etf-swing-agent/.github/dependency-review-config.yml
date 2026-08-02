@@ -1,0 +1,29 @@
+# Dependency Review Configuration
+# See https://github.com/actions/dependency-review-action#configuration-options
+
+# Fail on high severity vulnerabilities
+fail-on-severity: high
+
+# Allow specific vulnerabilities that are false positives or accepted risks
+allow-ghsas:
+  # Example: GHSA-xxxx-xxxx-xxxx  # Reason: False positive in transitive dependency
+
+# Ignore specific scopes
+ignore-scopes:
+  - development  # dev dependencies only used in CI/testing
+
+# License policies
+licenses:
+  allowed:
+    - MIT
+    - Apache-2.0
+    - BSD-2-Clause
+    - BSD-3-Clause
+    - ISC
+    - Python-2.0
+  forbidden:
+    - GPL-2.0
+    - GPL-3.0
+    - AGPL-3.0
+    - LGPL-2.1
+    - LGPL-3.0
