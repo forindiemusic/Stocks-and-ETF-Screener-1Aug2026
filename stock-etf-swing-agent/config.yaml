@@ -100,6 +100,14 @@ risk:
   take_profit_atr_mult: 3.0  # Take profit = entry + 3*ATR
   max_correlated_positions: 3 # Max positions with >0.7 correlation
 
+# Day-Trade Horizon Settings (used when --horizon day)
+day_trade:
+  enabled: true
+  min_score_threshold: 0.30  # Lower threshold for day-trade scores (they cluster lower)
+  stop_loss_atr_mult: 1.5    # Tighter stop for day trades
+  take_profit_atr_mult: 2.0  # Tighter take profit for day trades
+  volume_spike_threshold: 1.5 # Min volume ratio to confirm day-trade signal
+
 # Output
 output:
   top_n: 5

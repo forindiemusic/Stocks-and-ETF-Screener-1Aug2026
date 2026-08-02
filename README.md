@@ -18,7 +18,9 @@ I used the following LLMs with the most current release:
 
 4 - Tencent: Hy3 - Additional code improvements.
 
-5 - Anthropic: Claude Opus 4.8 - Implemented Additional Code Improvements 
+5 - Anthropic: Claude Opus 4.8 - Implemented Additional Code Improvements
+
+6 - GitHub Copilot (DeepSeek V4 Flash) - Implemented day-trade horizon (--horizon day), modern tooling (pyproject.toml, pre-commit, CI), type hints, and comprehensive documentation. 
 
 The project was designed to use free sources for financial news and information.  
 
@@ -28,4 +30,17 @@ While the stock market has been on an upswing.  There are many factors that coul
 
 This tool is for educational and research purposes only. Past performance does not guarantee future results. Always conduct your own research and consider consulting with a financial advisor before making investment decisions.
 
-Please see Stocks-and-ETF-Screener --> README-DETAILS.md for more information.
+## Quick Start
+
+```bash
+cd stock-etf-swing-agent
+pip install -r requirements.txt
+python etf_and_stock_agent.py --mode stock
+```
+
+For day-trade horizon (1-5 day signals):
+```bash
+python etf_and_stock_agent.py --mode stock --horizon day
+```
+
+Please see `stock-etf-swing-agent/README-DETAILS.md` for full documentation.

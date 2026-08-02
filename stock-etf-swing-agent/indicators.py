@@ -128,6 +128,209 @@ def calculate_short_term_indicators(data: pd.DataFrame) -> Dict[str, float]:
     return ind
 
 
+def calculate_day_trade_indicators(data: pd.DataFrame) -> Dict[str, float]:
+    """
+    Ultra-short (1-3 day) indicators for day-scale entries.
+
+    Designed for a ~2 week (>= 10 rows) daily window. Captures 1-3 day
+    momentum, overnight gaps, Bollinger squeeze, volume spikes, and
+    proximity to recent highs/lows — the signals that drive gains over
+    1-3 days, not weeks.
+
+    Key additions vs calculate_short_term_indicators:
+    - ROC(1), ROC(2), ROC(3) for ultra-near momentum
+    - RSI(2) for 1-2 day overbought/oversold
+    - Overnight gap detection
+    - Bollinger Band squeeze (low volatility setup)
+    - Proximity to 5-day high/low
+    - Volume spike (today vs 5-day average)
+    """
+    if data is None or len(data) < 10:
+        return {}
+
+    close = data['Close'].values.astype(np.float64)
+    high = data['High'].values.astype(np.float64)
+    low = data['Low'].values.astype(np.float64)
+    volume = data['Volume'].values.astype(np.float64)
+    close_series = data['Close']
+    high_series = data['High']
+    low_series = data['Low']
+    open_series = data['Open']
+    volume_series = data['Volume']
+
+    ind: Dict[str, float] = {}
+    ind['price'] = float(close_series.iloc[-1])
+
+    # --- Ultra-short moving averages ---
+    ind['sma_3'] = float(close_series.rolling(3).mean().iloc[-1])
+    ind['sma_5'] = float(close_series.rolling(5).mean().iloc[-1])
+
+    # --- 1/2/3-day momentum (returns) ---
+    ind['roc_1'] = (close_series.iloc[-1] / close_series.iloc[-2] - 1) * 100 if len(close_series) > 1 else 0.0
+    ind['roc_2'] = (close_series.iloc[-1] / close_series.iloc[-3] - 1) * 100 if len(close_series) > 2 else 0.0
+    ind['roc_3'] = (close_series.iloc[-1] / close_series.iloc[-4] - 1) * 100 if len(close_series) > 3 else 0.0
+
+    # --- Momentum acceleration: ROC(1) vs ROC(3) ---
+    # Positive = accelerating (stronger today than 3 days ago)
+    ind['momentum_accel'] = ind['roc_1'] - ind['roc_3']
+
+    # --- Overnight gap ---
+    # Gap % = (Open_today - Close_yesterday) / Close_yesterday
+    ind['gap_pct'] = float((open_series.iloc[-1] / close_series.iloc[-2] - 1) * 100) if len(close_series) > 1 else 0.0
+    ind['gap_filled'] = 1.0 if (ind['gap_pct'] > 0 and close_series.iloc[-1] > open_series.iloc[-1]) or \
+                        (ind['gap_pct'] < 0 and close_series.iloc[-1] < open_series.iloc[-1]) else 0.0
+
+    # --- RSI(2) — ultra-sensitive to 1-2 day extremes ---
+    rsi2 = talib.RSI(close, timeperiod=2)  # type: ignore[arg-type]
+    ind['rsi_2'] = float(rsi2[-1]) if not np.isnan(rsi2[-1]) else 50.0
+
+    # --- Bollinger Band squeeze (volatility contraction) ---
+    # Squeeze = BB width / SMA20 — low values precede breakouts
+    sma_20 = close_series.rolling(20).mean()
+    std_20 = close_series.rolling(20).std()
+    bb_width = ((sma_20 + 2 * std_20) - (sma_20 - 2 * std_20)).iloc[-1]
+    bb_sma = (sma_20 * 4 * std_20 / sma_20).iloc[-1] if sma_20.iloc[-1] > 0 else 1.0
+    ind['bb_width'] = float(bb_width)
+    ind['bb_squeeze'] = float(bb_width / sma_20.iloc[-1]) if sma_20.iloc[-1] > 0 else 1.0
+
+    # --- Proximity to 5-day high/low ---
+    high_5 = float(high_series.rolling(5).max().iloc[-1])
+    low_5 = float(low_series.rolling(5).min().iloc[-1])
+    ind['high_5'] = high_5
+    ind['low_5'] = low_5
+    range_5 = high_5 - low_5
+    if range_5 > 0:
+        ind['proximity_high_5'] = float((ind['price'] - low_5) / range_5)  # 0=at low, 1=at high
+    else:
+        ind['proximity_high_5'] = 0.5
+
+    # --- Volume spike (today vs 5-day average) ---
+    vol_sma5 = float(volume_series.rolling(5).mean().iloc[-1])
+    ind['volume_ratio_1d'] = float(volume[-1] / vol_sma5) if vol_sma5 > 0 else 1.0  # type: ignore[union-attr]
+
+    # --- Intraday volatility (today's range / close) ---
+    ind['intraday_range_pct'] = float((high_series.iloc[-1] - low_series.iloc[-1]) / close_series.iloc[-1] * 100)
+
+    # --- ATR(2) for 1-2 day volatility ---
+    atr2 = talib.ATR(high, low, close, timeperiod=2)  # type: ignore[arg-type]
+    ind['atr_2'] = float(atr2[-1]) if not np.isnan(atr2[-1]) else 0.0
+
+    return ind
+
+
+def calculate_day_trade_score(
+    indicators: Dict[str, float],
+    spy_indicators: Optional[Dict[str, float]] = None,
+) -> float:
+    """
+    Score a symbol for day-scale (1-5 day) entries, 0.0 to 1.0.
+
+    Designed for ultra-short holding periods. Rewards:
+    - Strong 1-3 day momentum (risk-adjusted, relative to SPY)
+    - Momentum acceleration (getting stronger, not fading)
+    - Bullish gap behavior (gaps up and holds / fills)
+    - RSI(2) in a healthy 30-70 zone (not exhausted)
+    - Bollinger squeeze setup (volatility contraction before expansion)
+    - Near 5-day high (breaking out, not fading)
+    - Volume spike (institutional interest)
+    - Low intraday volatility relative to ATR (efficient price discovery)
+
+    If spy_indicators is provided, momentum is scored on *relative* strength.
+    """
+    if not indicators:
+        return 0.0
+
+    comp: Dict[str, float] = {}
+    price = indicators.get('price', 0.0)
+    atr2 = indicators.get('atr_2', 0.0)
+
+    # --- 1. Risk-adjusted ultra-short momentum (30%) ---
+    roc_1 = indicators.get('roc_1', 0.0)
+    roc_2 = indicators.get('roc_2', 0.0)
+    roc_3 = indicators.get('roc_3', 0.0)
+
+    if spy_indicators:
+        roc_1 -= spy_indicators.get('roc_1', 0.0)
+        roc_2 -= spy_indicators.get('roc_2', 0.0)
+        roc_3 -= spy_indicators.get('roc_3', 0.0)
+
+    # Risk adjustment: scale by ATR(2) as % of price
+    risk_scale = (atr2 / price) * 100 if price > 0 and atr2 > 0 else 1.5
+    adj_roc_1 = roc_1 / max(risk_scale * 0.5, 0.3)
+    adj_roc_2 = roc_2 / max(risk_scale * 0.75, 0.5)
+    adj_roc_3 = roc_3 / max(risk_scale, 0.5)
+
+    mom = np.mean([
+        min(max(adj_roc_1, -1.0), 1.0),
+        min(max(adj_roc_2, -1.0), 1.0),
+        min(max(adj_roc_3, -1.0), 1.0),
+    ])
+    comp['momentum'] = float(max(0.0, float(mom)))
+
+    # --- 2. Momentum acceleration (15%) ---
+    # Positive accel = recent strength > past strength = bullish
+    accel = indicators.get('momentum_accel', 0.0)
+    comp['acceleration'] = float(min(max(accel / 2.0, 0.0), 1.0))
+
+    # --- 3. Gap analysis (15%) ---
+    gap = indicators.get('gap_pct', 0.0)
+    gap_filled = indicators.get('gap_filled', 0.0)
+    # Positive gap that holds = strong; negative gap that fills = reversal
+    if gap > 0.3 and gap_filled > 0.5:
+        comp['gap'] = 1.0  # Bullish gap up that held
+    elif gap > 0.3:
+        comp['gap'] = 0.7  # Gap up but faded
+    elif gap < -0.3 and gap_filled > 0.5:
+        comp['gap'] = 0.8  # Gap down that filled (reversal)
+    elif gap < -0.3:
+        comp['gap'] = 0.2  # Gap down that didn't fill
+    else:
+        comp['gap'] = 0.5  # No significant gap
+
+    # --- 4. RSI(2) — prefer 30-70 (not exhausted, not dead) ---
+    rsi2 = indicators.get('rsi_2', 50.0)
+    if 30 <= rsi2 <= 70:
+        comp['rsi'] = 1.0 - abs(rsi2 - 50.0) / 40.0
+    elif rsi2 > 80:
+        comp['rsi'] = max(0.0, (100.0 - rsi2) / 20.0)  # severely overbought
+    elif rsi2 < 20:
+        comp['rsi'] = max(0.0, (rsi2 - 5.0) / 15.0)    # severely oversold
+    else:
+        comp['rsi'] = 0.3  # moderately overbought/oversold
+
+    # --- 5. Bollinger squeeze (10%) ---
+    # Low BB squeeze = volatility contraction = potential breakout
+    squeeze = indicators.get('bb_squeeze', 1.0)
+    # Normalize: lower is better for setup
+    comp['squeeze'] = float(max(0.0, min(1.0, (0.15 - squeeze) / 0.10 + 0.5)))
+
+    # --- 6. Proximity to 5-day high (10%) ---
+    prox = indicators.get('proximity_high_5', 0.5)
+    # Near high = breaking out (0.7-1.0), near low = fading (0.0-0.3)
+    if prox >= 0.7:
+        comp['proximity'] = min(1.0, (prox - 0.5) * 2.0)  # 0.7→0.4, 1.0→1.0
+    elif prox <= 0.3:
+        comp['proximity'] = max(0.0, 1.0 - (0.3 - prox) * 3.0)  # 0.3→1.0, 0.0→0.1
+    else:
+        comp['proximity'] = 0.5  # Middle of range
+
+    # --- 7. Volume spike (5%) ---
+    vr = indicators.get('volume_ratio_1d', 1.0)
+    comp['volume'] = min(vr / 2.0, 1.0)
+
+    weights = {
+        'momentum': 0.30,
+        'acceleration': 0.15,
+        'gap': 0.15,
+        'rsi': 0.15,
+        'squeeze': 0.10,
+        'proximity': 0.10,
+        'volume': 0.05,
+    }
+    score = sum(comp[k] * w for k, w in weights.items())
+    return min(max(score, 0.0), 1.0)
+
+
 def calculate_short_term_score(
     indicators: Dict[str, float],
     spy_indicators: Optional[Dict[str, float]] = None,

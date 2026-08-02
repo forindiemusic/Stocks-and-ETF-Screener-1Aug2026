@@ -1,6 +1,6 @@
 # ETF Swing Trading Agent
 
-A Python-based agent that evaluates ETFs **and individual stocks** based on technical, fundamental, and sentiment factors to identify top candidates for near-term outperformance.
+A Python-based agent that evaluates ETFs **and individual stocks** based on technical, fundamental, and sentiment factors to identify top candidates for near-term outperformance. Supports both **swing** (3–20 day) and **day-trade** (1–5 day) horizons.
 
 ## Features
 
@@ -8,12 +8,15 @@ A Python-based agent that evaluates ETFs **and individual stocks** based on tech
 - **Market Regime Detection**: Adapts scoring based on current market conditions (bull/bear/sideways)
 - **Configurable Universe**: Easily customize the ETF universe to screen
 - **Dual Asset Support**: Screen ETFs (`--mode etf`), stocks (`--mode stock`), or both (`--mode all`)
-- **Short-Term Stock Scoring**: Stocks are ranked by a days-scale score with relative strength vs SPY, risk-adjusted momentum, short MA structure, RSI(5), MACD histogram, and volume confirmation
+- **Dual Horizon Support**: Choose between swing (`--horizon swing`, default) and day-trade (`--horizon day`) scoring
+- **Swing Stock Scoring**: Stocks ranked by days-scale score with relative strength vs SPY, risk-adjusted momentum, short MA structure, RSI(5), MACD histogram, and volume confirmation
+- **Day-Trade Stock Scoring**: Stocks ranked by ultra-short indicators — RSI(2), 1/2/3-day ROC, Bollinger squeeze, overnight gaps, momentum acceleration, and volume spikes
 - **Dual Action Model**: Stocks use a score-based action (Strong Buy / Buy / Hold / Sell); ETFs use growth outlook as the primary recommendation with dividend-yield evaluation as supplementary context (e.g., "Buy | Yield: 3.74% (low) | Currently owned")
 - **Rotation Signals**: Tracks rankings across runs and flags symbols that have dropped significantly since the previous evaluation
-- **Risk Management**: Built-in position sizing and correlation limits
+- **Risk Management**: Built-in position sizing and correlation limits; separate stop-loss/take-profit multipliers for day-trade mode
 - **CLI Output**: Clear, formatted output with rankings and scores
 - **Extensible Design**: Modular components for easy extension
+- **Modern Tooling**: Type hints (mypy strict), pre-commit hooks, GitHub Actions CI, pinned dependencies
 
 ## Installation
 
@@ -34,6 +37,9 @@ pip install ta-lib
 
 # Or use the pre-built wheels:
 pip install TA-Lib
+
+# Install dev dependencies (optional, for testing/linting)
+pip install -r requirements-dev.txt
 ```
 
 ## Configuration
@@ -43,12 +49,15 @@ Edit `config.yaml` to customize:
 - Technical/fundamental factor weights
 - Market regime detection parameters
 - Risk management settings
+- Day-trade horizon settings (stop-loss, take-profit, thresholds)
 - Output preferences
+
+A documented template is available at `config.example.yaml`.
 
 ## Usage
 
 ```bash
-# Run the agent (defaults to --mode stock)
+# Run the agent (defaults to --mode stock, --horizon swing)
 python etf_and_stock_agent.py
 
 # Run with custom config
@@ -66,6 +75,9 @@ python etf_and_stock_agent.py --mode all
 # Screen ONLY the ETFs listed in currently_own_etf.dat (your holdings)
 python etf_and_stock_agent.py --mode owned-etf
 
+# Day-trade horizon (1-5 day hold) — uses ultra-short indicators
+python etf_and_stock_agent.py --mode stock --horizon day
+
 # Run tests
 python test_agent.py
 ```
@@ -75,11 +87,18 @@ python test_agent.py
 | Mode | Universe source | Ranking |
 |------|----------------|---------|
 | `etf` (default in config) | `etf_universe` in `config.yaml` | Composite score |
-| `stock` | `corrently_own_stocks.dat` (one symbol per line) | **Short-term score** (days-scale) |
-| `all` | Union of the above two | Composite score for ETFs, short-term score for stocks |
+| `stock` | `corrently_own_stocks.dat` (one symbol per line) | **Short-term score** (swing) or **day-trade score** (day) |
+| `all` | Union of the above two | Composite score for ETFs, short-term/day-trade score for stocks |
 | `owned-etf` | `currently_own_etf.dat` (one symbol per line) | Composite score; never filtered by threshold |
 
 > Note: the stock file is named `corrently_own_stocks.dat` (intentional spelling). If the file is empty or missing, stock mode falls back to the config's `etf_universe`.
+
+### Horizons
+
+| Horizon | Flag | Hold Period | Indicators | Score Threshold |
+|---------|------|-------------|------------|-----------------|
+| Swing (default) | `--horizon swing` | 3–20 days | RSI(5), ROC(5/10), SMA5/10/20, MACD, ATR(5) | 0.35 |
+| Day-trade | `--horizon day` | 1–5 days | RSI(2), ROC(1/2/3), Bollinger squeeze, gaps, ATR(2) | 0.30 |
 
 ## Output
 
@@ -88,20 +107,21 @@ The agent prints the **top 3 recommendations** with detailed metrics:
 - **Action** — score-based for stocks (Strong Buy / Buy / Hold / Sell); for ETFs: growth outlook primary | dividend-yield evaluation supplementary (e.g., "Buy | Yield: 3.74% (low) | Currently owned")
 - **Currently owned** — shown on the action line when the ETF is listed in `currently_own_etf.dat`
 - **4-Week Growth Outlook** (ETFs only) — price-appreciation potential from momentum, sentiment/demand, price trend, market regime, and volume
+- **Day-Trade Score** (stocks, `--horizon day`) — 1–5 day ranking from ultra-short indicators
+- **Short-term Score** (stocks, `--horizon swing`) — days-scale, risk-adjusted, relative to SPY
 - Dividend yield (%)
 - Current price with 1-day and 1-week % change
-- **Stop-loss and take-profit** dollar amounts derived from ATR
-- For stocks: **Short-term Score** (days-scale, risk-adjusted, relative to SPY)
+- **Stop-loss and take-profit** dollar amounts derived from ATR (tighter multipliers in day-trade mode)
 - Composite score with technical / fundamental / sentiment components
 - **Sentiment source** — shows article count for real news, or "price-momentum proxy" when fallback is used
 - Market regime (bull/bear/sideways + volatility)
 - **Rotation signals**: flags symbols that dropped from the previous run's top 5
 
-Example (`--mode stock`):
+Example (`--mode stock --horizon swing`):
 
 ```
 ==============================================================================
-TOP 3 STOCKS RECOMMENDATIONS (detailed)
+TOP 3 STOCKS RECOMMENDATIONS (SWING HORIZON)
 ==============================================================================
 AAPL: Strong Buy
    Dividend Yield : 0.31%
@@ -131,11 +151,27 @@ DOW: Buy
    Regime         : bull (moderate vol)
 ```
 
+Example (`--mode stock --horizon day`):
+
+```
+==============================================================================
+TOP 3 STOCKS RECOMMENDATIONS (DAY-TRADE HORIZON)
+==============================================================================
+AAPL: Strong Buy
+   Dividend Yield : 0.31%
+   Price          : $333.74 (1D: +0.14%, 1W: +5.18%)
+   Stop-loss      : $321.54 | Take-profit: $346.00 (ATR: $8.13)
+   Day-Trade Score: 0.812 (1-5 day ranking)
+   Composite Score: 0.543 (Tech: 0.573, Fund: 0.350, Sent: 0.492)
+   Sentiment Source: 9 news articles
+   Regime         : bull (moderate vol)
+```
+
 Example (`--mode etf`):
 
 ```
 ==============================================================================
-TOP 3 ETFS RECOMMENDATIONS (detailed)
+TOP 3 ETFS RECOMMENDATIONS (SWING HORIZON)
 ==============================================================================
 XLE: Strong Buy | Yield: 3.74% (low) | Currently owned
    Dividend Yield : 3.74%
@@ -230,9 +266,9 @@ proxy (no news found)" so you can assess signal quality at a glance.
 - Volatility regime (VIX levels)
 - Reported alongside results (currently informational; not a score weight)
 
-### Short-Term Stock Scoring (stocks only)
+### Short-Term Stock Scoring (stocks only, swing horizon)
 
-When running with `--mode stock` (or `all`), each stock is scored on a
+When running with `--mode stock --horizon swing` (or `all`), each stock is scored on a
 **days-scale** basis so recommendations target gains over days rather than
 weeks. The score (0.0–1.0) is computed from a 1-month daily window in
 `indicators.py` (`calculate_short_term_indicators` + `calculate_short_term_score`):
@@ -248,6 +284,35 @@ weeks. The score (0.0–1.0) is computed from a 1-month daily window in
 
 In `stock` mode the screening is **ranked by `short_term_score`**; ETFs (and
 `all` mode's ETF portion) continue to rank by the composite score above.
+
+### Day-Trade Stock Scoring (stocks only, day-trade horizon)
+
+When running with `--mode stock --horizon day`, each stock is scored on an
+**ultra-short (1–5 day)** basis using a separate set of indicators optimized
+for catching moves over 1–3 days. The score (0.0–1.0) is computed from a
+~2-week daily window in `indicators.py`
+(`calculate_day_trade_indicators` + `calculate_day_trade_score`):
+
+- **Risk-adjusted ultra-short momentum (30%)**: 1-day, 2-day, and 3-day
+  rate-of-change minus SPY's ROC, divided by ATR(2)/price. Captures the
+  most recent price action with maximum sensitivity.
+- **Momentum acceleration (15%)**: ROC(1) minus ROC(3). Positive values mean
+  the stock is getting stronger, not fading — a key day-trade signal.
+- **Gap analysis (15%)**: Overnight gap percentage and whether the gap
+  direction held through the trading day. Bullish gaps that hold score
+  highest; gap-down reversals also score well.
+- **RSI(2) (15%)**: Ultra-sensitive 2-period RSI. Prefers the 30–70 zone
+  (not exhausted). Scores above 80 or below 20 are penalized.
+- **Bollinger squeeze (10%)**: Volatility contraction (narrow Bollinger
+  Bands) often precedes explosive breakouts. Lower squeeze values = higher
+  score.
+- **Proximity to 5-day high (10%)**: Price near the 5-day high suggests a
+  breakout is in progress; near the 5-day low suggests fading.
+- **Volume spike (5%)**: Today's volume vs 5-day average. Spikes confirm
+  institutional interest.
+
+In `day` mode the screening is **ranked by `day_trade_score`** with a lower
+threshold (0.30) since day-trade scores cluster lower than swing scores.
 
 ### 4-Week Growth Outlook (ETFs only)
 
@@ -272,7 +337,7 @@ supplementary context, e.g. `Strong Buy | Yield: 3.74% (low) | Currently owned`.
 
 ### Action Models
 
-**Stocks** use a score-based action model driven by short-term momentum:
+**Stocks (swing horizon)** use a score-based action model driven by short-term momentum:
 
 | Short-term Score | Action      |
 |------------------|-------------|
@@ -280,6 +345,19 @@ supplementary context, e.g. `Strong Buy | Yield: 3.74% (low) | Currently owned`.
 | 0.50 – 0.69      | Buy         |
 | 0.30 – 0.49      | Hold        |
 | < 0.30           | Sell        |
+
+**Stocks (day-trade horizon)** use the same thresholds but ranked by `day_trade_score`:
+
+| Day-Trade Score | Action      |
+|-----------------|-------------|
+| ≥ 0.70          | Strong Buy  |
+| 0.50 – 0.69     | Buy         |
+| 0.30 – 0.49     | Hold        |
+| < 0.30          | Sell        |
+
+Day-trade mode uses a lower minimum threshold (0.30 vs 0.35 for swing) and
+tighter stop-loss (1.5× ATR) and take-profit (2.0× ATR) multipliers,
+configurable in the `day_trade` section of `config.yaml`.
 
 **ETFs** use a **growth-primary** recommendation model:
 
@@ -398,6 +476,76 @@ PORTFOLIO HOLDINGS HISTORY (last 3 rebalances):
 Modify the backtest parameters in `run_backtest_example.py`:
 - ETF universe: Add/remove ETFs to test
 - Time period: Adjust start/end dates
+
+## Project Structure
+
+```
+stock-etf-swing-agent/
+├── pyproject.toml              # Modern packaging with tool configs
+├── config.yaml                 # User configuration
+├── config.example.yaml         # Documented configuration template
+├── .env.example                # Environment variables template
+├── requirements.txt            # Pinned production dependencies
+├── requirements-dev.txt        # Pinned development dependencies
+├── .pre-commit-config.yaml     # Pre-commit hooks (ruff, mypy, bandit)
+├── .github/workflows/ci.yml    # GitHub Actions CI pipeline
+├── etf_and_stock_agent.py      # Main agent (CLI entry point)
+├── indicators.py               # Technical indicator calculations
+├── scoring.py                  # Scoring functions (technical, fundamental)
+├── retry.py                    # Retry utility with exponential backoff
+├── backtest.py                 # Backtesting framework
+├── debug_agent.py              # Debug script for single-ETF testing
+├── quick_start.py              # Quick-start installation script
+├── test_agent.py               # Integration test for full pipeline
+├── tests/
+│   ├── conftest.py             # Shared test fixtures
+│   ├── test_indicators.py      # Unit tests for indicators
+│   ├── test_scoring.py         # Unit tests for scoring
+│   └── test_backtest.py        # Unit tests for backtester
+└── output/                     # Generated rankings and signals
+```
+
+## Development
+
+### Setup
+```bash
+# Install dev dependencies
+pip install -r requirements-dev.txt
+
+# Install pre-commit hooks
+pre-commit install
+```
+
+### Testing
+```bash
+# Run all tests
+python3 -m pytest tests/ -v
+
+# Run with coverage
+python3 -m pytest tests/ --cov=src --cov-report=term-missing
+```
+
+### Type Checking
+```bash
+python3 -m mypy etf_and_stock_agent.py indicators.py scoring.py retry.py
+```
+
+### Linting
+```bash
+# Check
+ruff check src tests
+
+# Format
+ruff format --check src tests
+```
+
+## Disclaimer
+
+This tool is for educational and research purposes only. Past performance does not guarantee future results. Always conduct your own research and consider consulting with a financial advisor before making investment decisions.
+
+## License
+
+MIT
 - Rebalancing frequency: Change to 'D' (daily), 'W' (weekly), or 'M' (monthly)
 - Lookback period: Modify how much historical data is used for evaluation
 

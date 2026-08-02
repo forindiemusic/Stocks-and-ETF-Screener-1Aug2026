@@ -107,6 +107,8 @@ from indicators import (
     calculate_technical_indicators,
     calculate_short_term_indicators,
     calculate_short_term_score,
+    calculate_day_trade_indicators,
+    calculate_day_trade_score,
     calculate_4week_growth_outlook,
 )
 from scoring import calculate_technical_score, calculate_fundamental_score
@@ -117,8 +119,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class ETFSwingAgent:
-    def __init__(self, config_path: str = "config.yaml", mode: str = "stock") -> None:
-        """Initialize the ETF Swing Agent with configuration."""
+    def __init__(self, config_path: str = "config.yaml", mode: str = "stock",
+                 horizon: str = "swing") -> None:
+        """Initialize the ETF Swing Agent with configuration.
+
+        Args:
+            config_path: Path to YAML configuration file.
+            mode: 'etf', 'stock', 'all', or 'owned-etf'.
+            horizon: 'swing' (3-20 day hold, default) or 'day' (1-5 day hold).
+                     'day' uses ultra-short indicators (RSI(2), 1-3d ROC,
+                     Bollinger squeeze, gaps) optimized for day-scale entries.
+        """
+        self.horizon = horizon
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
@@ -179,6 +191,7 @@ class ETFSwingAgent:
         self.fundamental_weights: Dict[str, float] = self.config['fundamental_weights']
         self.news_config: Dict[str, Any] = self.config['news']
         self.risk_config: Dict[str, Any] = self.config['risk']
+        self.day_trade_config: Dict[str, Any] = self.config.get('day_trade', {})
         self.output_config: Dict[str, Any] = self.config['output']
 
         # Composite score weights (must match backtester for consistency)
@@ -556,6 +569,7 @@ class ETFSwingAgent:
         # Uses SPY 1mo data for relative-strength comparison.
         # Also compute for ETFs to power the 4-week growth outlook.
         short_term_score = 0.0
+        day_trade_score = 0.0
         growth_outlook = None
         short_data = self.fetch_etf_data(symbol, "1mo")
         if short_data is not None and len(short_data) >= 20:
@@ -574,6 +588,16 @@ class ETFSwingAgent:
                     price_change_1w=price_change_1w,
                     market_regime=market_regime['regime'],
                 )
+
+        # Day-trade (1-5 day) score — computed when horizon == "day".
+        # Uses ~2 weeks of data for ultra-short indicators.
+        if self.horizon == "day":
+            day_data = self.fetch_etf_data(symbol, "2wk")
+            if day_data is not None and len(day_data) >= 10:
+                day_ind = calculate_day_trade_indicators(day_data)
+                spy_day = self.fetch_etf_data("SPY", "2wk")
+                spy_day_ind = calculate_day_trade_indicators(spy_day) if spy_day is not None and len(spy_day) >= 10 else None
+                day_trade_score = calculate_day_trade_score(day_ind, spy_indicators=spy_day_ind)
 
         # Dividend yield — compute once here so main() doesn't need extra calls
         dividend_yield_pct = None
@@ -599,6 +623,7 @@ class ETFSwingAgent:
             "sentiment_source": sentiment_source,
             "composite_score": composite_score,
             "short_term_score": short_term_score,
+            "day_trade_score": day_trade_score,
             "growth_outlook": growth_outlook,
             "dividend_yield_pct": dividend_yield_pct,
             "current_price": current_price,
@@ -650,12 +675,16 @@ class ETFSwingAgent:
             f"{len(results)} scored, {errors} errors"
         )
 
-        # Rank: stocks by short_term_score, ETFs by growth_score (primary criteria).
+        # Rank: stocks by short_term_score (swing) or day_trade_score (day),
+        # ETFs by growth_score (primary criteria).
         # In "all" mode, both are 0-1 so they're comparable on the same scale.
         for r in results:
             is_stock = r['symbol'] in self._stock_symbols
             if is_stock:
-                r['_rank_score'] = r['short_term_score']
+                if self.horizon == "day":
+                    r['_rank_score'] = r.get('day_trade_score', 0.0)
+                else:
+                    r['_rank_score'] = r['short_term_score']
             else:
                 growth = r.get('growth_outlook')
                 r['_rank_score'] = growth['growth_score'] if (growth and growth.get('growth_score', 0.0) > 0) else r['composite_score']
@@ -669,11 +698,15 @@ class ETFSwingAgent:
         etf_threshold = self.risk_config['min_score_threshold']
         stock_threshold = 0.35
         owned_etf_threshold = 0.0
+        # Day-trade threshold (lower; day-trade scores cluster lower)
+        day_trade_threshold = self.day_trade_config.get('min_score_threshold', 0.30)
         filtered_results: List[Dict[str, Any]] = []
         for r in results:
             is_stock = r['symbol'] in self._stock_symbols
             if self.mode == "owned-etf":
                 thresh = owned_etf_threshold
+            elif self.horizon == "day":
+                thresh = day_trade_threshold
             elif is_stock:
                 thresh = stock_threshold
             else:
@@ -783,17 +816,25 @@ class ETFSwingAgent:
             return
 
         print("\n" + "="*80)
-        print(f"{label.upper()} SWING TRADING AGENT - TOP RECOMMENDATIONS")
+        horizon_label = "DAY-TRADE" if self.horizon == "day" else "SWING"
+        print(f"{label.upper()} {horizon_label} AGENT - TOP RECOMMENDATIONS")
         print("="*80)
-        print(f"Screened {len(self.etf_universe)} {label}")
+        print(f"Screened {len(self.etf_universe)} {label} ({horizon_label} horizon)")
         print(f"Market Regime: {results[0]['market_regime'] if results else 'Unknown'} ({results[0]['volatility_regime'] if results else 'Unknown'} volatility)")
         print("-"*80)
 
         for i, etf in enumerate(results, 1):
             atr = etf.get('atr', 0)
             price = etf['current_price']
-            stop_loss = price - self.risk_config['stop_loss_atr_mult'] * atr if atr > 0 else None
-            take_profit = price + self.risk_config['take_profit_atr_mult'] * atr if atr > 0 else None
+            # Use day-trade multipliers when horizon is "day"
+            if self.horizon == "day":
+                sl_mult = self.day_trade_config.get('stop_loss_atr_mult', 1.5)
+                tp_mult = self.day_trade_config.get('take_profit_atr_mult', 2.0)
+            else:
+                sl_mult = self.risk_config['stop_loss_atr_mult']
+                tp_mult = self.risk_config['take_profit_atr_mult']
+            stop_loss = price - sl_mult * atr if atr > 0 else None
+            take_profit = price + tp_mult * atr if atr > 0 else None
             is_stock = etf['symbol'] in self._stock_symbols
             is_owned_etf = etf['symbol'] in self._owned_etf_symbols
             rank_score = etf.get('_rank_score', etf['composite_score'])
@@ -845,7 +886,9 @@ class ETFSwingAgent:
 
             print(f"{i}. {etf['symbol']}  [{div_action}]")
             print(f"   Dividend Yield : {yield_str}")
-            if is_stock:
+            if self.horizon == "day":
+                print(f"   Day-Trade Score: {etf.get('day_trade_score', 0.0):.3f} (1-5 day ranking)")
+            elif is_stock:
                 print(f"   Short-term Score: {etf['short_term_score']:.3f} (days-scale ranking)")
             else:
                 growth = etf.get('growth_outlook')
@@ -952,17 +995,24 @@ def main() -> None:
         "--mode", choices=['etf', 'stock', 'all', 'owned-etf'], default='stock',
         help="Mode of operation: 'etf' to evaluate ETFs from config, 'stock' to evaluate stocks from file, 'all' to evaluate both, 'owned-etf' to evaluate only the ETFs listed in currently_own_etf.dat (default: stock)"
     )
+    parser.add_argument(
+        "--horizon", choices=['swing', 'day'], default='swing',
+        help="Trading horizon: 'swing' (3-20 day hold, default) or 'day' (1-5 day hold). "
+             "'day' uses ultra-short indicators (RSI(2), 1-3d ROC, Bollinger squeeze, gaps) "
+             "optimized for day-scale entries."
+    )
     args = parser.parse_args()
 
-    agent = ETFSwingAgent(args.config, mode=args.mode)
+    agent = ETFSwingAgent(args.config, mode=args.mode, horizon=args.horizon)
     results = agent.run_screening()
     
     # Output top results with detailed metrics (dividend yield pre-computed in evaluate_etf)
     top_n = min(len(results), 3)
     top_results = results[:top_n]
     label = agent._asset_label_plural
+    horizon_label = "DAY-TRADE" if args.horizon == "day" else "SWING"
     print("\n" + "=" * 78)
-    print(f"TOP {top_n} {label.upper()} RECOMMENDATIONS (detailed)")
+    print(f"TOP {top_n} {label.upper()} RECOMMENDATIONS ({horizon_label} HORIZON)")
     print("=" * 78)
     for result in top_results:
         symbol = result['symbol']
@@ -1026,10 +1076,18 @@ def main() -> None:
         atr = result.get('atr', 0)
         price = result['current_price']
         if atr > 0:
-            sl = price - agent.risk_config['stop_loss_atr_mult'] * atr
-            tp = price + agent.risk_config['take_profit_atr_mult'] * atr
+            if agent.horizon == "day":
+                sl_mult = agent.day_trade_config.get('stop_loss_atr_mult', 1.5)
+                tp_mult = agent.day_trade_config.get('take_profit_atr_mult', 2.0)
+            else:
+                sl_mult = agent.risk_config['stop_loss_atr_mult']
+                tp_mult = agent.risk_config['take_profit_atr_mult']
+            sl = price - sl_mult * atr
+            tp = price + tp_mult * atr
             print(f"   Stop-loss      : ${sl:.2f} | Take-profit: ${tp:.2f} (ATR: ${atr:.2f})")
-        if agent.mode in ("stock", "all"):
+        if agent.horizon == "day":
+            print(f"   Day-Trade Score : {result.get('day_trade_score', 0.0):.3f} (1-5 day ranking)")
+        elif agent.mode in ("stock", "all"):
             print(f"   Short-term Score: {result['short_term_score']:.3f} (days-scale ranking)")
 
         # 4-week growth outlook for ETFs
