@@ -142,14 +142,14 @@ class ETFSwingAgent:
             self._stock_symbols: Set[str] = set()
             self._owned_etf_symbols: Set[str] = set(self._load_symbols_from_file('currently_own_etf.dat'))
         elif mode == "stock":
-            self.etf_universe = self._load_symbols_from_file('corrently_own_stocks.dat')
+            self.etf_universe = self._load_symbols_from_file('list_of_stocks_to_review_for_purchase.dat')
             if not self.etf_universe:
                 self.etf_universe = self.config['etf_universe']
             self._stock_symbols = set(self.etf_universe)
             self._owned_etf_symbols = set()
         elif mode == "all":
             etf_symbols = set(self.config['etf_universe'])
-            stock_symbols = set(self._load_symbols_from_file('corrently_own_stocks.dat'))
+            stock_symbols = set(self._load_symbols_from_file('list_of_stocks_to_review_for_purchase.dat'))
             self.etf_universe = list(etf_symbols.union(stock_symbols))
             self._stock_symbols = stock_symbols
             self._owned_etf_symbols = set(self._load_symbols_from_file('currently_own_etf.dat'))
@@ -165,14 +165,26 @@ class ETFSwingAgent:
             self.etf_universe = owned
             self._stock_symbols = set()
             self._owned_etf_symbols = set(owned)
+        elif mode == "owned-stock":
+            # Screen ONLY the stocks listed in currently_own_stocks.dat.
+            # Show all with full detail, sorted by action (Buy > Hold > Sell).
+            owned = self._load_symbols_from_file('currently_own_stocks.dat')
+            if not owned:
+                raise ValueError(
+                    "No symbols found in currently_own_stocks.dat. "
+                    "Add at least one stock (one symbol per line) to use --mode owned-stock."
+                )
+            self.etf_universe = owned
+            self._stock_symbols = set(owned)
+            self._owned_etf_symbols = set()
         else:
-            raise ValueError(f"Invalid mode: {mode}. Choose from 'etf', 'stock', 'all', 'owned-etf'.")
+            raise ValueError(f"Invalid mode: {mode}. Choose from 'etf', 'stock', 'all', 'owned-etf', 'owned-stock'.")
 
         # Store mode so evaluation/ranking can apply short-term logic for stocks
         self.mode = mode
 
         # Human-readable label for the asset type being evaluated
-        if mode == "stock":
+        if mode in ("stock", "owned-stock"):
             self._asset_label = "Stock"
             self._asset_label_plural = "Stocks"
         elif mode in ("etf", "owned-etf"):
@@ -509,6 +521,12 @@ class ETFSwingAgent:
         if data is None:
             return {"symbol": symbol, "error": "No data available"}
 
+        # Validate data has at least some valid close prices
+        # Drop NaN values from Close column
+        valid_close = data['Close'].dropna()
+        if valid_close.empty:
+            return {"symbol": symbol, "error": "Invalid price data (all NaN)"}
+
         # Calculate components
         technical_indicators = calculate_technical_indicators(data)
 
@@ -560,10 +578,37 @@ class ETFSwingAgent:
                 sentiment_score * cw['sentiment']
             )
 
-        # Current price info
-        current_price = data['Close'].iloc[-1]
-        price_change_1d = (data['Close'].iloc[-1] / data['Close'].iloc[-2] - 1) * 100 if len(data) >= 2 else 0
-        price_change_1w = (data['Close'].iloc[-1] / data['Close'].iloc[-5] - 1) * 100 if len(data) >= 5 else 0
+        # Current price info - use ticker info for most current price (includes pre/post market)
+        # Fall back to historical data if ticker info unavailable
+        current_price = float('nan')
+        price_change_1d = 0
+        price_change_1w = 0
+        
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            # Use regularMarketPrice (current or last close) or preMarketPrice if available
+            if 'regularMarketPrice' in info and info['regularMarketPrice'] is not None:
+                current_price = float(info['regularMarketPrice'])
+            elif 'preMarketPrice' in info and info['preMarketPrice'] is not None:
+                current_price = float(info['preMarketPrice'])
+            else:
+                # Fallback to historical data
+                valid_close = data['Close'].dropna()
+                current_price = float(valid_close.iloc[-1]) if not valid_close.empty else float('nan')
+            
+            # Calculate price changes using historical data (more reliable for % changes)
+            valid_close = data['Close'].dropna()
+            if len(valid_close) >= 2:
+                price_change_1d = (valid_close.iloc[-1] / valid_close.iloc[-2] - 1) * 100
+            if len(valid_close) >= 5:
+                price_change_1w = (valid_close.iloc[-1] / valid_close.iloc[-5] - 1) * 100
+        except Exception:
+            # Fallback to historical data
+            valid_close = data['Close'].dropna()
+            current_price = float(valid_close.iloc[-1]) if not valid_close.empty else float('nan')
+            price_change_1d = (valid_close.iloc[-1] / valid_close.iloc[-2] - 1) * 100 if len(valid_close) >= 2 else 0
+            price_change_1w = (valid_close.iloc[-1] / valid_close.iloc[-5] - 1) * 100 if len(valid_close) >= 5 else 0
 
         # Short-term (days-scale) score — computed for stocks in any mode.
         # Uses SPY 1mo data for relative-strength comparison.
@@ -590,14 +635,18 @@ class ETFSwingAgent:
                 )
 
         # Day-trade (1-5 day) score — computed when horizon == "day".
-        # Uses ~2 weeks of data for ultra-short indicators.
+        # Uses ~1 month of data for ultra-short indicators (need 20+ days for SMA20).
+        day_trade_score = 0.0
         if self.horizon == "day":
-            day_data = self.fetch_etf_data(symbol, "2wk")
-            if day_data is not None and len(day_data) >= 10:
-                day_ind = calculate_day_trade_indicators(day_data)
-                spy_day = self.fetch_etf_data("SPY", "2wk")
-                spy_day_ind = calculate_day_trade_indicators(spy_day) if spy_day is not None and len(spy_day) >= 10 else None
-                day_trade_score = calculate_day_trade_score(day_ind, spy_indicators=spy_day_ind)
+            day_data = self.fetch_etf_data(symbol, "1mo")
+            if day_data is not None and len(day_data) >= 20:
+                # Validate day_data has valid close prices
+                valid_day_close = day_data['Close'].dropna()
+                if not valid_day_close.empty:
+                    day_ind = calculate_day_trade_indicators(day_data)
+                    spy_day = self.fetch_etf_data("SPY", "1mo")
+                    spy_day_ind = calculate_day_trade_indicators(spy_day) if spy_day is not None and len(spy_day) >= 20 else None
+                    day_trade_score = calculate_day_trade_score(day_ind, spy_indicators=spy_day_ind)
 
         # Dividend yield — compute once here so main() doesn't need extra calls
         dividend_yield_pct = None
@@ -695,9 +744,12 @@ class ETFSwingAgent:
         #   Stocks: 0.35 (lower bar; short-term scores cluster lower)
         #   owned-etf: 0.0 (user explicitly wants to evaluate these specific
         #              holdings, so never filter them out by score)
+        #   owned-stock: 0.0 (user explicitly wants to evaluate these specific
+        #              holdings, so never filter them out by score)
         etf_threshold = self.risk_config['min_score_threshold']
         stock_threshold = 0.35
         owned_etf_threshold = 0.0
+        owned_stock_threshold = 0.0
         # Day-trade threshold (lower; day-trade scores cluster lower)
         day_trade_threshold = self.day_trade_config.get('min_score_threshold', 0.30)
         filtered_results: List[Dict[str, Any]] = []
@@ -705,6 +757,8 @@ class ETFSwingAgent:
             is_stock = r['symbol'] in self._stock_symbols
             if self.mode == "owned-etf":
                 thresh = owned_etf_threshold
+            elif self.mode == "owned-stock":
+                thresh = owned_stock_threshold
             elif self.horizon == "day":
                 thresh = day_trade_threshold
             elif is_stock:
@@ -713,6 +767,13 @@ class ETFSwingAgent:
                 thresh = etf_threshold
             if r['_rank_score'] >= thresh:
                 filtered_results.append(r)
+
+        # For owned-stock mode, return ALL results without correlation filter or top_n limit
+        if self.mode == "owned-stock":
+            # Sort by rank score (best first)
+            filtered_results.sort(key=lambda x: x['_rank_score'], reverse=True)
+            logger.info(f"Screening complete. Found {len(filtered_results)} {label} above threshold, returning all {len(filtered_results)}")
+            return filtered_results
 
         # Fallback: if threshold is too strict, use top N by score regardless
         top_n = self.output_config['top_n']
@@ -826,6 +887,13 @@ class ETFSwingAgent:
         for i, etf in enumerate(results, 1):
             atr = etf.get('atr', 0)
             price = etf['current_price']
+            # Format price for display
+            price_str = f"${price:.2f}" if price == price else "N/A"  # NaN check
+            price_change_1d = etf.get('price_change_1d', 0)
+            price_change_1w = etf.get('price_change_1w', 0)
+            price_change_1d_str = f"{price_change_1d:+.2f}%" if price_change_1d == price_change_1d else "N/A"
+            price_change_1w_str = f"{price_change_1w:+.2f}%" if price_change_1w == price_change_1w else "N/A"
+            
             # Use day-trade multipliers when horizon is "day"
             if self.horizon == "day":
                 sl_mult = self.day_trade_config.get('stop_loss_atr_mult', 1.5)
@@ -833,8 +901,8 @@ class ETFSwingAgent:
             else:
                 sl_mult = self.risk_config['stop_loss_atr_mult']
                 tp_mult = self.risk_config['take_profit_atr_mult']
-            stop_loss = price - sl_mult * atr if atr > 0 else None
-            take_profit = price + tp_mult * atr if atr > 0 else None
+            stop_loss = price - sl_mult * atr if atr > 0 and price == price else None
+            take_profit = price + tp_mult * atr if atr > 0 and price == price else None
             is_stock = etf['symbol'] in self._stock_symbols
             is_owned_etf = etf['symbol'] in self._owned_etf_symbols
             rank_score = etf.get('_rank_score', etf['composite_score'])
@@ -865,7 +933,15 @@ class ETFSwingAgent:
                     else:
                         growth_action = "Sell"
                 else:
-                    growth_action = "N/A"
+                    # Fallback to composite score when growth outlook unavailable
+                    if rank_score >= 0.70:
+                        growth_action = "Strong Buy"
+                    elif rank_score >= 0.50:
+                        growth_action = "Buy"
+                    elif rank_score >= 0.30:
+                        growth_action = "Hold"
+                    else:
+                        growth_action = "Sell"
 
                 # --- Supplementary: dividend-yield evaluation ---
                 if div_pct is not None:
@@ -903,7 +979,7 @@ class ETFSwingAgent:
                     print(f"   4-Week Growth   : N/A (insufficient data)")
             print(f"   Composite Score: {etf['composite_score']:.3f}")
             print(f"   Technical: {etf['technical_score']:.3f} | Fundamental: {etf['fundamental_score']:.3f} | Sentiment: {etf['sentiment_score']:.3f} ({etf.get('sentiment_source', '?')})")
-            print(f"   Price: ${etf['current_price']:.2f} (1D: {etf['price_change_1d']:+.2f}%, 1W: {etf['price_change_1w']:+.2f}%)")
+            print(f"   Price: {price_str} (1D: {price_change_1d_str}, 1W: {price_change_1w_str})")
             if stop_loss and take_profit:
                 print(f"   Stop-loss: ${stop_loss:.2f} | Take-profit: ${take_profit:.2f} | ATR: ${atr:.2f}")
             print(f"   Regime: {etf['market_regime']} ({etf['volatility_regime']} vol)")
@@ -992,8 +1068,8 @@ def main() -> None:
         help="Path to YAML configuration file (default: config.yaml)",
     )
     parser.add_argument(
-        "--mode", choices=['etf', 'stock', 'all', 'owned-etf'], default='stock',
-        help="Mode of operation: 'etf' to evaluate ETFs from config, 'stock' to evaluate stocks from file, 'all' to evaluate both, 'owned-etf' to evaluate only the ETFs listed in currently_own_etf.dat (default: stock)"
+        "--mode", choices=['etf', 'stock', 'all', 'owned-etf', 'owned-stock'], default='stock',
+        help="Mode of operation: 'etf' to evaluate ETFs from config, 'stock' to evaluate stocks from file, 'all' to evaluate both, 'owned-etf' to evaluate only the ETFs listed in currently_own_etf.dat, 'owned-stock' to evaluate only the stocks listed in currently_own_stocks.dat (default: stock)"
     )
     parser.add_argument(
         "--horizon", choices=['swing', 'day'], default='swing',
@@ -1006,9 +1082,15 @@ def main() -> None:
     agent = ETFSwingAgent(args.config, mode=args.mode, horizon=args.horizon)
     results = agent.run_screening()
     
-    # Output top results with detailed metrics (dividend yield pre-computed in evaluate_etf)
-    top_n = min(len(results), 3)
-    top_results = results[:top_n]
+    # For owned-stock mode, show ALL stocks sorted by score (best to worst)
+    # For other modes, show top 3
+    if args.mode == "owned-stock":
+        top_results = results  # Show all
+        top_n = len(results)
+    else:
+        top_n = min(len(results), 3)
+        top_results = results[:top_n]
+    
     label = agent._asset_label_plural
     horizon_label = "DAY-TRADE" if args.horizon == "day" else "SWING"
     print("\n" + "=" * 78)
@@ -1067,15 +1149,21 @@ def main() -> None:
 
         print(f"{symbol}: {action}")
         print(f"   Dividend Yield : {yield_str}")
+        price = result['current_price']
+        price_str = f"${price:.2f}" if price == price else "N/A"
+        price_change_1d = result.get('price_change_1d', 0)
+        price_change_1w = result.get('price_change_1w', 0)
+        price_change_1d_str = f"{price_change_1d:+.2f}%" if price_change_1d == price_change_1d else "N/A"
+        price_change_1w_str = f"{price_change_1w:+.2f}%" if price_change_1w == price_change_1w else "N/A"
         print(
-            f"   Price          : ${result['current_price']:.2f} "
-            f"(1D: {result['price_change_1d']:+.2f}%, "
-            f"1W: {result['price_change_1w']:+.2f}%)"
+            f"   Price          : {price_str} "
+            f"(1D: {price_change_1d_str}, "
+            f"1W: {price_change_1w_str})"
         )
         # Stop-loss / take-profit from ATR
         atr = result.get('atr', 0)
         price = result['current_price']
-        if atr > 0:
+        if atr > 0 and price == price:
             if agent.horizon == "day":
                 sl_mult = agent.day_trade_config.get('stop_loss_atr_mult', 1.5)
                 tp_mult = agent.day_trade_config.get('take_profit_atr_mult', 2.0)

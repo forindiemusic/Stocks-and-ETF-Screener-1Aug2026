@@ -281,7 +281,7 @@ def _compute_tracking_error(
 
     try:
         etf_returns = price_data['Close'].pct_change(fill_method=None).dropna()
-        bench_returns = benchmark_data['Close'].pct_change().dropna()
+        bench_returns = benchmark_data['Close'].pct_change(fill_method=None).dropna()
 
         # Align on common dates
         common_idx = etf_returns.index.intersection(bench_returns.index)

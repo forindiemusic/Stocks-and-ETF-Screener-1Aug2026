@@ -69,7 +69,7 @@ class ETFBacktester:
 
         Args:
             etf_universe: List of symbols to consider. If None, derived from
-                ``mode`` (config etf_universe, corrently_own_stocks.dat, or
+                ``mode`` (config etf_universe, list_of_stocks_to_review_for_purchase.dat, or
                 currently_own_etf.dat).
             lookback_months: Months of historical data to use for evaluation
             config_path: Path to YAML configuration file
@@ -88,7 +88,7 @@ class ETFBacktester:
         # --- Universe derivation (mirrors ETFSwingAgent.__init__) ---
         if etf_universe is None:
             if mode == "stock":
-                etf_universe = _load_symbols_from_file('corrently_own_stocks.dat')
+                etf_universe = _load_symbols_from_file('list_of_stocks_to_review_for_purchase.dat')
                 if not etf_universe:
                     etf_universe = config['etf_universe']
             elif mode == "owned-etf":
@@ -101,7 +101,7 @@ class ETFBacktester:
                 etf_universe = owned
             elif mode == "all":
                 etf_symbols = set(config['etf_universe'])
-                stock_syms = set(_load_symbols_from_file('corrently_own_stocks.dat'))
+                stock_syms = set(_load_symbols_from_file('list_of_stocks_to_review_for_purchase.dat'))
                 etf_universe = list(etf_symbols.union(stock_syms))
             else:  # 'etf'
                 etf_universe = config['etf_universe']

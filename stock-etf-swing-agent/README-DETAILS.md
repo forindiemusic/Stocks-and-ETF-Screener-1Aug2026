@@ -66,7 +66,7 @@ python etf_and_stock_agent.py --config my_config.yaml
 # Screen only ETFs from config.yaml's etf_universe
 python etf_and_stock_agent.py --mode etf
 
-# Screen only stocks listed in corrently_own_stocks.dat
+# Screen only stocks listed in list_of_stocks_to_review_for_purchase.dat
 python etf_and_stock_agent.py --mode stock
 
 # Screen both ETFs and stocks (union of the two universes)
@@ -74,6 +74,10 @@ python etf_and_stock_agent.py --mode all
 
 # Screen ONLY the ETFs listed in currently_own_etf.dat (your holdings)
 python etf_and_stock_agent.py --mode owned-etf
+
+# Screen ONLY the stocks listed in currently_own_stocks.dat (your holdings)
+# Shows all with full detail, sorted by action (Buy > Hold > Sell)
+python etf_and_stock_agent.py --mode owned-stock
 
 # Day-trade horizon (1-5 day hold) — uses ultra-short indicators
 python etf_and_stock_agent.py --mode stock --horizon day
@@ -87,11 +91,12 @@ python test_agent.py
 | Mode | Universe source | Ranking |
 |------|----------------|---------|
 | `etf` (default in config) | `etf_universe` in `config.yaml` | Composite score |
-| `stock` | `corrently_own_stocks.dat` (one symbol per line) | **Short-term score** (swing) or **day-trade score** (day) |
+| `stock` | `list_of_stocks_to_review_for_purchase.dat` (one symbol per line) | **Short-term score** (swing) or **day-trade score** (day) |
 | `all` | Union of the above two | Composite score for ETFs, short-term/day-trade score for stocks |
 | `owned-etf` | `currently_own_etf.dat` (one symbol per line) | Composite score; never filtered by threshold |
+| `owned-stock` | `currently_own_stocks.dat` (one symbol per line) | Short-term/day-trade score; never filtered; sorted Buy > Hold > Sell |
 
-> Note: the stock file is named `corrently_own_stocks.dat` (intentional spelling). If the file is empty or missing, stock mode falls back to the config's `etf_universe`.
+> Note: the stock file is named `list_of_stocks_to_review_for_purchase.dat`. If the file is empty or missing, stock mode falls back to the config's `etf_universe`.
 
 ### Horizons
 
@@ -437,7 +442,7 @@ python3 backtest.py
 The `ETFBacktester` constructor accepts a `mode` argument (`'etf'`, `'stock'`,
 `'all'`, `'owned-etf'`) and an optional `stock_symbols` list. When `mode` is
 omitted but `etf_universe` is provided, it defaults to ETF behavior. In
-`'stock'` mode the universe is read from `corrently_own_stocks.dat` (falling
+`'stock'` mode the universe is read from `list_of_stocks_to_review_for_purchase.dat` (falling
 back to `config.yaml`'s `etf_universe`), and every symbol is treated as a
 stock. In `'all'` mode, stocks and ETFs are mixed and ranked on a common 0–1
 scale via `_rank_score_for()`.

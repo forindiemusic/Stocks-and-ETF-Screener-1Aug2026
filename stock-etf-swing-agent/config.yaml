@@ -57,13 +57,13 @@ etf_universe:
   - OGIG  # Alps O'Shares Global Internet Giants ETF
   - INVN  # Alger Russell Innovation ETF
   - AIUP  # Finq First US Lg Cap Ai-Mgd Equity ETF
-  - DUNK  # Dana Unconstrained Equity ETF 
-  - BCHP  # Principal Focused Blue Chip ETF
+  # DUNK  # Dana Unconstrained Equity ETF 
+  # BCHP  # Principal Focused Blue Chip ETF
   - RNIN  # Bushido Capital US Smid Cap Equity ETF
   - PNQI  # Invesco Nasdaq Internet ETF
 
   # Fidelity - recent Top gainers - Sector Equity (5 days)
-  - SAPH  # Sap Se Adrhedged
+  # SAPH  # Sap Se Adrhedged
   - WCLD  # Wisdomtree Cloud Computing Fund 
   - CLOU  # Global X Cloud Computing ETF
   - AIHY  # Defiance Ai Hyperscale Leaders ETF
@@ -74,19 +74,19 @@ etf_universe:
   # Fidelity - recent Top gainers - Miscellaneous (5 days)
   # recommend use during positive / bull market trend
   # notice all ETFs are 2X type -- higher risk / reward
-  - MSFC # Corgi Msft 2X Daily ETF
-  - MSFU # Direxion Daily Msft Bull 2X ETF
-  - MSFL # Graniteshares 2X Long Msft Daily ETF
-  - MSFX # T-Rex 2X Long Microsoft Daily Target ETF
-  - AXTX # Tradr 2X Long Axti Daily ETF
-  - AXTC # Corgi Axti 2X Daily ETF 
-  - AXTL # Leverage Shares 2X Long Axti Daily ETF
+  # MSFC # Corgi Msft 2X Daily ETF
+  # MSFU # Direxion Daily Msft Bull 2X ETF
+  # MSFL # Graniteshares 2X Long Msft Daily ETF
+  # MSFX # T-Rex 2X Long Microsoft Daily Target ETF
+  # AXTX # Tradr 2X Long Axti Daily ETF
+  # AXTC # Corgi Axti 2X Daily ETF 
+  # AXTL # Leverage Shares 2X Long Axti Daily ETF
 
   # Fidelity - recent Top gainers - Alternative (5 days)
   - NTRL # First Trust Equity Market Neutral ETF
   - NTSI # Wisdomtree International Efficient Core Fund
   - NTSD # Wisdomtree Efficient US Plus International Eqty Fd
-  - MKTN # Federated Hermes Mdt Market Neutral ETF
+  # MKTN # Federated Hermes Mdt Market Neutral ETF
   - JPFP # Jpmorgan Managed Futures Plus ETF 
   - FLSP # Franklin Systematic Style Premia ETF
   - NTSX # Wisdomtree US Efficient Core Fund

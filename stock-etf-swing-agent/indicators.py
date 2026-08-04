@@ -148,15 +148,24 @@ def calculate_day_trade_indicators(data: pd.DataFrame) -> Dict[str, float]:
     if data is None or len(data) < 10:
         return {}
 
-    close = data['Close'].values.astype(np.float64)
-    high = data['High'].values.astype(np.float64)
-    low = data['Low'].values.astype(np.float64)
-    volume = data['Volume'].values.astype(np.float64)
-    close_series = data['Close']
-    high_series = data['High']
-    low_series = data['Low']
-    open_series = data['Open']
-    volume_series = data['Volume']
+    # Use last valid close price (skip trailing NaN)
+    close_series = data['Close'].dropna()
+    if close_series.empty:
+        return {}
+    
+    # Get the last valid index
+    last_valid_idx = close_series.index[-1]
+    
+    # Get series up to last valid index
+    close = data.loc[:last_valid_idx, 'Close'].values.astype(np.float64)
+    high = data.loc[:last_valid_idx, 'High'].values.astype(np.float64)
+    low = data.loc[:last_valid_idx, 'Low'].values.astype(np.float64)
+    volume = data.loc[:last_valid_idx, 'Volume'].values.astype(np.float64)
+    close_series = data.loc[:last_valid_idx, 'Close']
+    high_series = data.loc[:last_valid_idx, 'High']
+    low_series = data.loc[:last_valid_idx, 'Low']
+    open_series = data.loc[:last_valid_idx, 'Open']
+    volume_series = data.loc[:last_valid_idx, 'Volume']
 
     ind: Dict[str, float] = {}
     ind['price'] = float(close_series.iloc[-1])
