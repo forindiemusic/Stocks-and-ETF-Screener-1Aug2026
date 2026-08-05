@@ -59,10 +59,12 @@ etf_universe:
   - AIUP  # Finq First US Lg Cap Ai-Mgd Equity ETF
   - LSGR  #
   - QBIG  #
-  # DUNK  # Dana Unconstrained Equity ETF 
-  # BCHP  # Principal Focused Blue Chip ETF
+  - DUNK  # Dana Unconstrained Equity ETF 
+  - BCHP  # Principal Focused Blue Chip ETF
   - RNIN  # Bushido Capital US Smid Cap Equity ETF
   - PNQI  # Invesco Nasdaq Internet ETF
+  - TLG   #
+  - ACKY  #
 
   # Fidelity - recent Top gainers - Sector Equity (5 days)
   # SAPH  # Sap Se Adrhedged
@@ -92,6 +94,15 @@ etf_universe:
   - JPFP # Jpmorgan Managed Futures Plus ETF 
   - FLSP # Franklin Systematic Style Premia ETF
   - NTSX # Wisdomtree US Efficient Core Fund
+
+  # Yahoo Finance - recent Top gainers ( Daily )
+  - FDTX # Fidelity Disruptive Technoloy ETF
+  - GTEK # Goldman Sachs Future Tech Leaders ETF
+  - TEK  # iShares Technology Opportunitie
+  - TTEQ # T.Rowe Price Technology ETF
+  - GTPE # Goldman Sachs MSCI World Private Equity Return Track ETF
+  - FTEC # Fidelity MSCI Information Technology ETF
+  - JTEK # JPMorgan U.S. Tech Leaders ETF
 
 # Market Regime Detection
 market_regime:
