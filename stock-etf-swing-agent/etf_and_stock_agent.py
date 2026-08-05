@@ -111,7 +111,7 @@ from indicators import (
     calculate_day_trade_score,
     calculate_4week_growth_outlook,
 )
-from scoring import calculate_technical_score, calculate_fundamental_score
+from scoring import calculate_technical_score, calculate_fundamental_score, compute_composite_relative_strength
 from retry import retry, retry_call
 
 # Setup logging
@@ -681,6 +681,7 @@ class ETFSwingAgent:
             "market_regime": market_regime['regime'],
             "volatility_regime": market_regime['volatility'],
             "atr": technical_indicators.get('atr_14', 0.0),
+            "technical_indicators": technical_indicators,
             "data_points": len(data)
         }
 
@@ -724,6 +725,27 @@ class ETFSwingAgent:
             f"{len(results)} scored, {errors} errors"
         )
 
+        # --- Relative Strength Percentile Ranking ---
+        # Compute percentile ranks for key indicators across the universe.
+        # This gives each symbol a relative strength score vs peers.
+        indicator_sets: Dict[str, Dict[str, float]] = {}
+        for key in ('roc_10', 'obv_trend', 'atr_trend_ratio', 'volume_ratio', 'adx'):
+            vals = {}
+            for r in results:
+                tech = r.get('technical_indicators', {})
+                if key in tech and tech[key] is not None:
+                    vals[r['symbol']] = tech[key]
+            if vals:
+                indicator_sets[key] = vals
+
+        rs_percentiles = compute_composite_relative_strength(indicator_sets)
+
+        # Blend relative strength into _rank_score (20% weight)
+        rs_weight = 0.20
+        for r in results:
+            rs = rs_percentiles.get(r['symbol'], 0.5)
+            r['_relative_strength'] = rs
+
         # Rank: stocks by short_term_score (swing) or day_trade_score (day),
         # ETFs by growth_score (primary criteria).
         # In "all" mode, both are 0-1 so they're comparable on the same scale.
@@ -731,12 +753,15 @@ class ETFSwingAgent:
             is_stock = r['symbol'] in self._stock_symbols
             if is_stock:
                 if self.horizon == "day":
-                    r['_rank_score'] = r.get('day_trade_score', 0.0)
+                    base_score = r.get('day_trade_score', 0.0)
                 else:
-                    r['_rank_score'] = r['short_term_score']
+                    base_score = r['short_term_score']
             else:
                 growth = r.get('growth_outlook')
-                r['_rank_score'] = growth['growth_score'] if (growth and growth.get('growth_score', 0.0) > 0) else r['composite_score']
+                base_score = growth['growth_score'] if (growth and growth.get('growth_score', 0.0) > 0) else r['composite_score']
+            # Blend base score with relative strength percentile
+            rs = r.get('_relative_strength', 0.5)
+            r['_rank_score'] = base_score * (1 - rs_weight) + rs * rs_weight
         results.sort(key=lambda x: x['_rank_score'], reverse=True)
 
         # Filter by minimum threshold — mode-aware:
@@ -973,7 +998,8 @@ class ETFSwingAgent:
                         f"   4-Week Growth   : {growth['growth_score']:.3f} "
                         f"(Mom: {growth['momentum']:.3f}, Sent: {growth['sentiment']:.3f}, "
                         f"Trend: {growth['price_trend']:.3f}, Regime: {growth['regime_adj']:.3f}, "
-                        f"Vol: {growth['volume']:.3f})"
+                        f"Vol: {growth['volume']:.3f}, OBV: {growth['obv_trend']:.3f}, "
+                        f"ATR: {growth['atr_trend']:.3f})"
                     )
                 else:
                     print(f"   4-Week Growth   : N/A (insufficient data)")
@@ -1186,7 +1212,8 @@ def main() -> None:
                     f"   4-Week Growth   : {growth['growth_score']:.3f} "
                     f"(Mom: {growth['momentum']:.3f}, Sent: {growth['sentiment']:.3f}, "
                     f"Trend: {growth['price_trend']:.3f}, Regime: {growth['regime_adj']:.3f}, "
-                    f"Vol: {growth['volume']:.3f})"
+                    f"Vol: {growth['volume']:.3f}, OBV: {growth['obv_trend']:.3f}, "
+                    f"ATR: {growth['atr_trend']:.3f})"
                 )
             else:
                 print(f"   4-Week Growth   : N/A (insufficient data)")

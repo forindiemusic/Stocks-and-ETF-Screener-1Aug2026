@@ -32,12 +32,13 @@ class TestCalculateTechnicalIndicators:
         expected_keys = {
             'sma_20', 'sma_50', 'sma_200', 'price',
             'price_vs_sma50', 'price_vs_sma200', 'sma50_vs_sma200',
-            'macd', 'macd_signal', 'macd_histogram',
+            'macd', 'macd_signal', 'macd_histogram', 'macd_crossover',
             'rsi', 'adx',
             'bb_upper', 'bb_lower', 'bb_position',
             'roc_10', 'roc_20',
             'volume_sma_20', 'volume_ratio',
-            'atr_14', 'volatility_20',
+            'atr_14', 'atr_trend_ratio', 'obv_trend', 'volatility_20',
+            'vwap', 'vwap_distance_pct', 'cmf_20', 'rvol_5',
         }
         assert set(result.keys()) == expected_keys
 
@@ -120,7 +121,9 @@ class TestCalculateShortTermIndicators:
         expected_keys = {
             'price', 'sma_5', 'sma_10', 'sma_20',
             'roc_5', 'roc_10', 'rsi_5',
-            'macd_histogram', 'volume_ratio_3d', 'atr_5',
+            'macd_histogram', 'macd_crossover', 'volume_ratio_3d', 'atr_5',
+            'momentum_quality', 'obv_trend', 'atr_trend_ratio',
+            'vwap', 'vwap_distance_pct', 'cmf_20', 'rvol_5',
         }
         assert set(result.keys()) == expected_keys
 
@@ -215,6 +218,8 @@ class TestCalculateDayTradeIndicators:
             'rsi_2', 'bb_width', 'bb_squeeze',
             'high_5', 'low_5', 'proximity_high_5',
             'volume_ratio_1d', 'intraday_range_pct', 'atr_2',
+            'obv_trend', 'atr_trend_ratio',
+            'vwap', 'vwap_distance_pct', 'cmf_20', 'rvol_5',
         }
         assert set(result.keys()) == expected_keys
 

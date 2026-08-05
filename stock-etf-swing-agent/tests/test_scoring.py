@@ -42,6 +42,10 @@ class TestCalculateTechnicalScore:
             'volume_ratio': 1.5,
             'volatility_20': 0.20,
             'adx': 35,
+            'obv_trend': 2.0,
+            'cmf_20': 0.3,
+            'rvol_5': 2.0,
+            'atr_trend_ratio': 1.5,
         }
         score = calculate_technical_score(perfect)
         assert score > 0.6
