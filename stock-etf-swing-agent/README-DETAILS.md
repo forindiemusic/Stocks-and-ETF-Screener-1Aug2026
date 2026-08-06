@@ -441,14 +441,6 @@ Each run saves rankings to `output/last_rankings.csv`. On the next run, any
 symbol that was previously in the top 5 but has dropped below the top 10 (or
 below a 0.30 score threshold) is flagged as a rotation exit candidate.
 
-## Disclaimer
-
-This tool is for educational and research purposes only. Past performance does not guarantee future results. Always conduct your own research and consider consulting with a financial advisor before making investment decisions.
-
-## License
-
-MIT
-
 ## Backtesting Framework
 
 The agent includes a comprehensive backtesting framework to validate strategy performance:
@@ -582,6 +574,9 @@ ruff check src tests
 ruff format --check src tests
 ```
 
+- Rebalancing frequency: Change to 'D' (daily), 'W' (weekly), or 'M' (monthly)
+- Lookback period: Modify how much historical data is used for evaluation
+
 ## Disclaimer
 
 This tool is for educational and research purposes only. Past performance does not guarantee future results. Always conduct your own research and consider consulting with a financial advisor before making investment decisions.
@@ -589,8 +584,6 @@ This tool is for educational and research purposes only. Past performance does n
 ## License
 
 MIT
-- Rebalancing frequency: Change to 'D' (daily), 'W' (weekly), or 'M' (monthly)
-- Lookback period: Modify how much historical data is used for evaluation
 
 ## Platform-Specific Installation
 
