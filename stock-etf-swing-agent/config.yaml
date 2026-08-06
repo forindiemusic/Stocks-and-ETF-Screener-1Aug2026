@@ -57,13 +57,17 @@ etf_universe:
   - OGIG  # Alps O'Shares Global Internet Giants ETF
   - INVN  # Alger Russell Innovation ETF
   - AIUP  # Finq First US Lg Cap Ai-Mgd Equity ETF
+  - LSGR  #
+  - QBIG  #
   - DUNK  # Dana Unconstrained Equity ETF 
   - BCHP  # Principal Focused Blue Chip ETF
   - RNIN  # Bushido Capital US Smid Cap Equity ETF
   - PNQI  # Invesco Nasdaq Internet ETF
+  - TLG   #
+  - ACKY  #
 
   # Fidelity - recent Top gainers - Sector Equity (5 days)
-  - SAPH  # Sap Se Adrhedged
+  # SAPH  # Sap Se Adrhedged
   - WCLD  # Wisdomtree Cloud Computing Fund 
   - CLOU  # Global X Cloud Computing ETF
   - AIHY  # Defiance Ai Hyperscale Leaders ETF
@@ -74,22 +78,31 @@ etf_universe:
   # Fidelity - recent Top gainers - Miscellaneous (5 days)
   # recommend use during positive / bull market trend
   # notice all ETFs are 2X type -- higher risk / reward
-  - MSFC # Corgi Msft 2X Daily ETF
-  - MSFU # Direxion Daily Msft Bull 2X ETF
-  - MSFL # Graniteshares 2X Long Msft Daily ETF
-  - MSFX # T-Rex 2X Long Microsoft Daily Target ETF
-  - AXTX # Tradr 2X Long Axti Daily ETF
-  - AXTC # Corgi Axti 2X Daily ETF 
-  - AXTL # Leverage Shares 2X Long Axti Daily ETF
+  # MSFC # Corgi Msft 2X Daily ETF
+  # MSFU # Direxion Daily Msft Bull 2X ETF
+  # MSFL # Graniteshares 2X Long Msft Daily ETF
+  # MSFX # T-Rex 2X Long Microsoft Daily Target ETF
+  # AXTX # Tradr 2X Long Axti Daily ETF
+  # AXTC # Corgi Axti 2X Daily ETF 
+  # AXTL # Leverage Shares 2X Long Axti Daily ETF
 
   # Fidelity - recent Top gainers - Alternative (5 days)
   - NTRL # First Trust Equity Market Neutral ETF
   - NTSI # Wisdomtree International Efficient Core Fund
   - NTSD # Wisdomtree Efficient US Plus International Eqty Fd
-  - MKTN # Federated Hermes Mdt Market Neutral ETF
+  # MKTN # Federated Hermes Mdt Market Neutral ETF
   - JPFP # Jpmorgan Managed Futures Plus ETF 
   - FLSP # Franklin Systematic Style Premia ETF
   - NTSX # Wisdomtree US Efficient Core Fund
+
+  # Yahoo Finance - recent Top gainers ( Daily )
+  - FDTX # Fidelity Disruptive Technoloy ETF
+  - GTEK # Goldman Sachs Future Tech Leaders ETF
+  - TEK  # iShares Technology Opportunitie
+  - TTEQ # T.Rowe Price Technology ETF
+  - GTPE # Goldman Sachs MSCI World Private Equity Return Track ETF
+  - FTEC # Fidelity MSCI Information Technology ETF
+  - JTEK # JPMorgan U.S. Tech Leaders ETF
 
 # Market Regime Detection
 market_regime:
@@ -164,6 +177,32 @@ composite_weights:
 
 # Backtesting Configuration
 backtest:
+  # Historical current-news sentiment cannot be reproduced. Use 'off' for a
+  # neutral 0.5 contribution or 'price_proxy' for an explicit price-momentum
+  # experiment (which can overlap technical momentum signals).
+  sentiment_mode: "off"
+  # Modules neutralized one at a time by run_factor_ablation(). This reports
+  # walk-forward deltas; it does not tune or optimize strategy weights.
+  factor_ablation_factors:
+    - technical
+    - fundamental
+    - sentiment
+    - relative_strength
+  # Effective controls used by the backtester. ``min_rank_score`` is applied
+  # before correlation filtering; equal sizing is the conservative baseline.
+  min_rank_score: 0.0
+  position_sizing_method: "equal"
+  # Candidate profiles for run_out_of_sample_tuning(). Select only on the
+  # training range, then evaluate the selected profile once on untouched data.
+  oos_tuning_profiles:
+    baseline: {}
+    tighter_exits:
+      stop_loss_atr_mult: 1.5
+      take_profit_atr_mult: 2.5
+    score_weighted:
+      position_sizing_method: "score_weighted"
+    higher_quality:
+      min_rank_score: 0.50
   # Transaction costs (applied per rebalance on turnover)
   commission_per_share: 0.0      # Per-share commission ($0 for most modern brokers)
   slippage_bps: 5.0              # Slippage in basis points (0.05% = 5 bps)

@@ -13,6 +13,47 @@ import talib
 from typing import Dict, Optional
 
 
+def _calculate_rolling_vwap(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    volume: pd.Series,
+    window: int = 20,
+) -> float:
+    """Return a trailing daily VWAP-style reference over ``window`` sessions.
+
+    True VWAP resets each trading session and requires intraday bars. The
+    screener uses daily OHLCV data, so this rolling calculation is deliberately
+    a 20-session volume-weighted price reference rather than a session VWAP.
+    """
+    typical_price = (high + low + close) / 3
+    numerator = (typical_price * volume).rolling(window).sum().iloc[-1]
+    denominator = volume.rolling(window).sum().iloc[-1]
+    return float(numerator / denominator) if denominator > 0 else float(close.iloc[-1])
+
+
+def _calculate_same_weekday_rvol(volume: pd.Series, lookback_weeks: int = 5) -> float:
+    """Compare current volume with the prior ``lookback_weeks`` same weekdays.
+
+    The calculation needs the current occurrence plus five prior occurrences,
+    which means roughly six months of daily history is fetched by callers.
+    A neutral 1.0 is returned whenever a dated five-week comparison is not
+    available.
+    """
+    if not isinstance(volume.index, pd.DatetimeIndex):
+        return 1.0
+
+    current_weekday = volume.index[-1].weekday()
+    same_weekday = volume[volume.index.weekday == current_weekday]
+    previous = same_weekday.iloc[:-1].tail(lookback_weeks)
+    if len(previous) < lookback_weeks:
+        return 1.0
+
+    baseline = previous.mean()
+    value = volume.iloc[-1] / baseline if baseline > 0 else 1.0
+    return float(value) if np.isfinite(value) else 1.0
+
+
 def calculate_technical_indicators(data: pd.DataFrame) -> Dict[str, float]:
     """Calculate technical indicators for scoring."""
     if data is None or len(data) < 50:
@@ -44,6 +85,28 @@ def calculate_technical_indicators(data: pd.DataFrame) -> Dict[str, float]:
     indicators['macd'] = float(macd_line[-1])
     indicators['macd_signal'] = float(macd_signal[-1])
     indicators['macd_histogram'] = float(macd_hist[-1])
+    # MACD crossover: +1 if MACD crossed above signal within last 3 days,
+    # -1 if crossed below, 0 otherwise. Classic entry/exit trigger.
+    if len(macd_line) > 3 and not np.isnan(macd_line[-1]) and not np.isnan(macd_signal[-1]):
+        crossed_up = False
+        crossed_down = False
+        for i in range(1, 4):  # check last 3 days
+            prev_line = macd_line[-i-1]
+            prev_sig = macd_signal[-i-1]
+            if np.isnan(prev_line) or np.isnan(prev_sig):
+                continue
+            if prev_line < prev_sig and macd_line[-i] > macd_signal[-i]:
+                crossed_up = True
+            elif prev_line > prev_sig and macd_line[-i] < macd_signal[-i]:
+                crossed_down = True
+        if crossed_up:
+            indicators['macd_crossover'] = 1.0
+        elif crossed_down:
+            indicators['macd_crossover'] = -1.0
+        else:
+            indicators['macd_crossover'] = 0.0
+    else:
+        indicators['macd_crossover'] = 0.0
 
     # --- RSI (TA-Lib — uses Wilder's smoothing, not SMA) ---
     rsi = talib.RSI(close, timeperiod=14)  # type: ignore[arg-type]
@@ -69,9 +132,44 @@ def calculate_technical_indicators(data: pd.DataFrame) -> Dict[str, float]:
     indicators['volume_sma_20'] = volume_series.rolling(20).mean().iloc[-1]
     indicators['volume_ratio'] = volume_series.iloc[-1] / indicators['volume_sma_20'] if indicators['volume_sma_20'] > 0 else 1
 
+    # --- Rolling 20-session VWAP-style reference ---
+    indicators['vwap'] = _calculate_rolling_vwap(
+        data['High'], data['Low'], data['Close'], volume_series
+    )
+    indicators['vwap_distance_pct'] = float((indicators['price'] / indicators['vwap'] - 1) * 100) if indicators['vwap'] > 0 else 0.0
+
+    # --- Chaikin Money Flow (CMF) over 20 days ---
+    high_low = data['High'] - data['Low']
+    mfv = pd.Series(np.zeros(len(data)), index=data.index)
+    valid = high_low > 0
+    mfv[valid] = ((data['Close'][valid] - data['Low'][valid]) - (data['High'][valid] - data['Close'][valid])) / high_low[valid] * data['Volume'][valid]
+    cmf_20 = mfv.rolling(20).sum() / volume_series.rolling(20).sum()
+    indicators['cmf_20'] = float(cmf_20.iloc[-1]) if not np.isnan(cmf_20.iloc[-1]) else 0.0
+
+    # --- Relative volume: current vs the five prior matching weekdays ---
+    indicators['rvol_5'] = _calculate_same_weekday_rvol(volume_series)
+
     # --- ATR (TA-Lib — uses Wilder's smoothing) ---
     atr = talib.ATR(high, low, close, timeperiod=14)  # type: ignore[arg-type]
     indicators['atr_14'] = float(atr[-1]) if not np.isnan(atr[-1]) else 0.0
+
+    # --- ATR Trend Direction (volatility expansion/contraction) ---
+    # ATR(10) vs ATR(30) ratio > 1.1 = volatility expanding (breakout potential)
+    # Ratio < 0.9 = volatility contracting (consolidation)
+    atr_10 = talib.ATR(high, low, close, timeperiod=10)  # type: ignore[arg-type]
+    atr_30 = talib.ATR(high, low, close, timeperiod=30)  # type: ignore[arg-type]
+    atr10_val = float(atr_10[-1]) if not np.isnan(atr_10[-1]) else 0.0
+    atr30_val = float(atr_30[-1]) if not np.isnan(atr_30[-1]) else 0.0
+    indicators['atr_trend_ratio'] = atr10_val / atr30_val if atr30_val > 0 else 1.0
+
+    # --- OBV (On-Balance Volume) Trend ---
+    # OBV slope over 10 days: positive = accumulation, negative = distribution
+    obv = (np.sign(close_series.diff()) * volume_series).fillna(0).cumsum()
+    obv_10d_ago = obv.iloc[-11] if len(obv) > 10 else obv.iloc[0]
+    obv_change = obv.iloc[-1] - obv_10d_ago
+    obv_price = close_series.iloc[-1]
+    # Normalize OBV change as % of price to make comparable across symbols
+    indicators['obv_trend'] = float(obv_change / obv_price) if obv_price > 0 else 0.0
 
     # --- Volatility (pandas — annualized 20-day) ---
     indicators['volatility_20'] = close_series.pct_change(fill_method=None).rolling(20).std().iloc[-1] * np.sqrt(252)
@@ -109,21 +207,79 @@ def calculate_short_term_indicators(data: pd.DataFrame) -> Dict[str, float]:
     ind['roc_5'] = (close_series.iloc[-1] / close_series.iloc[-6] - 1) * 100 if len(close_series) > 5 else 0.0
     ind['roc_10'] = (close_series.iloc[-1] / close_series.iloc[-11] - 1) * 100 if len(close_series) > 10 else 0.0
 
+    # Momentum quality: ROC(5) > ROC(10) means momentum is accelerating (not fading)
+    # Positive = recent momentum stronger than older momentum = quality signal
+    ind['momentum_quality'] = ind['roc_5'] - ind['roc_10']
+
     # Short RSI (5) — sensitive to day-scale overbought/oversold
     rsi5 = talib.RSI(close, timeperiod=5)  # type: ignore[arg-type]
     ind['rsi_5'] = float(rsi5[-1]) if not np.isnan(rsi5[-1]) else 50.0
 
     # MACD histogram (standard 12/26/9) — near-term trend acceleration
-    _, _, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)  # type: ignore[arg-type]
+    macd_line, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)  # type: ignore[arg-type]
     ind['macd_histogram'] = float(macd_hist[-1]) if not np.isnan(macd_hist[-1]) else 0.0
+    # MACD crossover: +1 if crossed above signal within last 3 days, -1 if below
+    if len(macd_line) > 3 and not np.isnan(macd_line[-1]) and not np.isnan(macd_signal[-1]):
+        crossed_up = False
+        crossed_down = False
+        for i in range(1, 4):
+            prev_line = macd_line[-i-1]
+            prev_sig = macd_signal[-i-1]
+            if np.isnan(prev_line) or np.isnan(prev_sig):
+                continue
+            if prev_line < prev_sig and macd_line[-i] > macd_signal[-i]:
+                crossed_up = True
+            elif prev_line > prev_sig and macd_line[-i] < macd_signal[-i]:
+                crossed_down = True
+        if crossed_up:
+            ind['macd_crossover'] = 1.0
+        elif crossed_down:
+            ind['macd_crossover'] = -1.0
+        else:
+            ind['macd_crossover'] = 0.0
+    else:
+        ind['macd_crossover'] = 0.0
 
     # Volume confirmation: average of last 3 days vs 20-day average
     vol_sma20 = float(volume_series.rolling(20).mean().iloc[-1])
     ind['volume_ratio_3d'] = float(volume[-3:].mean() / vol_sma20) if vol_sma20 > 0 else 1.0  # type: ignore[union-attr]
 
+    # --- Rolling 20-session VWAP-style reference ---
+    ind['vwap'] = _calculate_rolling_vwap(
+        data['High'], data['Low'], data['Close'], volume_series
+    )
+    ind['vwap_distance_pct'] = float((ind['price'] / ind['vwap'] - 1) * 100) if ind['vwap'] > 0 else 0.0
+
+    # --- Chaikin Money Flow (CMF) over 20 days ---
+    # MFV = ((close - low) - (high - close)) / (high - low) * volume
+    # CMF = sum(MFV, 20) / sum(volume, 20)
+    high_low = data['High'] - data['Low']
+    mfv = pd.Series(np.zeros(len(data)), index=data.index)
+    valid = high_low > 0
+    mfv[valid] = ((data['Close'][valid] - data['Low'][valid]) - (data['High'][valid] - data['Close'][valid])) / high_low[valid] * data['Volume'][valid]
+    cmf_20 = mfv.rolling(20).sum() / volume_series.rolling(20).sum()
+    ind['cmf_20'] = float(cmf_20.iloc[-1]) if not np.isnan(cmf_20.iloc[-1]) else 0.0
+
+    # --- Relative volume: current vs the five prior matching weekdays ---
+    ind['rvol_5'] = _calculate_same_weekday_rvol(volume_series)
+
     # Short ATR (5) for day-scale volatility
     atr5 = talib.ATR(high, low, close, timeperiod=5)  # type: ignore[arg-type]
     ind['atr_5'] = float(atr5[-1]) if not np.isnan(atr5[-1]) else 0.0
+
+    # ATR Trend Direction (volatility expansion/contraction)
+    atr_10 = talib.ATR(high, low, close, timeperiod=10)  # type: ignore[arg-type]
+    atr_30 = talib.ATR(high, low, close, timeperiod=30)  # type: ignore[arg-type]
+    atr10_val = float(atr_10[-1]) if not np.isnan(atr_10[-1]) else 0.0
+    atr30_val = float(atr_30[-1]) if not np.isnan(atr_30[-1]) else 0.0
+    ind['atr_trend_ratio'] = atr10_val / atr30_val if atr30_val > 0 else 1.0
+
+    # OBV (On-Balance Volume) Trend
+    obv = (np.sign(close_series.diff()) * volume_series).fillna(0).cumsum()
+    obv_10d_ago = obv.iloc[-11] if len(obv) > 10 else obv.iloc[0]
+    obv_change = obv.iloc[-1] - obv_10d_ago
+    obv_price = close_series.iloc[-1]
+    ind['obv_trend'] = float(obv_change / obv_price) if obv_price > 0 else 0.0
 
     return ind
 
@@ -148,15 +304,24 @@ def calculate_day_trade_indicators(data: pd.DataFrame) -> Dict[str, float]:
     if data is None or len(data) < 10:
         return {}
 
-    close = data['Close'].values.astype(np.float64)
-    high = data['High'].values.astype(np.float64)
-    low = data['Low'].values.astype(np.float64)
-    volume = data['Volume'].values.astype(np.float64)
-    close_series = data['Close']
-    high_series = data['High']
-    low_series = data['Low']
-    open_series = data['Open']
-    volume_series = data['Volume']
+    # Use last valid close price (skip trailing NaN)
+    close_series = data['Close'].dropna()
+    if close_series.empty:
+        return {}
+    
+    # Get the last valid index
+    last_valid_idx = close_series.index[-1]
+    
+    # Get series up to last valid index
+    close = data.loc[:last_valid_idx, 'Close'].values.astype(np.float64)
+    high = data.loc[:last_valid_idx, 'High'].values.astype(np.float64)
+    low = data.loc[:last_valid_idx, 'Low'].values.astype(np.float64)
+    volume = data.loc[:last_valid_idx, 'Volume'].values.astype(np.float64)
+    close_series = data.loc[:last_valid_idx, 'Close']
+    high_series = data.loc[:last_valid_idx, 'High']
+    low_series = data.loc[:last_valid_idx, 'Low']
+    open_series = data.loc[:last_valid_idx, 'Open']
+    volume_series = data.loc[:last_valid_idx, 'Volume']
 
     ind: Dict[str, float] = {}
     ind['price'] = float(close_series.iloc[-1])
@@ -211,9 +376,40 @@ def calculate_day_trade_indicators(data: pd.DataFrame) -> Dict[str, float]:
     # --- Intraday volatility (today's range / close) ---
     ind['intraday_range_pct'] = float((high_series.iloc[-1] - low_series.iloc[-1]) / close_series.iloc[-1] * 100)
 
+    # --- Rolling 20-session VWAP-style reference ---
+    ind['vwap'] = _calculate_rolling_vwap(
+        high_series, low_series, close_series, volume_series
+    )
+    ind['vwap_distance_pct'] = float((ind['price'] / ind['vwap'] - 1) * 100) if ind['vwap'] > 0 else 0.0
+
+    # --- Chaikin Money Flow (CMF) over 20 days ---
+    high_low = high_series - low_series
+    mfv = pd.Series(np.zeros(len(close_series)), index=close_series.index)
+    valid = high_low > 0
+    mfv[valid] = ((close_series[valid] - low_series[valid]) - (high_series[valid] - close_series[valid])) / high_low[valid] * volume_series[valid]
+    cmf_20 = mfv.rolling(20).sum() / volume_series.rolling(20).sum()
+    ind['cmf_20'] = float(cmf_20.iloc[-1]) if not np.isnan(cmf_20.iloc[-1]) else 0.0
+
+    # --- Relative volume: current vs the five prior matching weekdays ---
+    ind['rvol_5'] = _calculate_same_weekday_rvol(volume_series)
+
     # --- ATR(2) for 1-2 day volatility ---
     atr2 = talib.ATR(high, low, close, timeperiod=2)  # type: ignore[arg-type]
     ind['atr_2'] = float(atr2[-1]) if not np.isnan(atr2[-1]) else 0.0
+
+    # --- OBV (On-Balance Volume) Trend ---
+    obv = (np.sign(close_series.diff()) * volume_series).fillna(0).cumsum()
+    obv_5d_ago = obv.iloc[-6] if len(obv) > 5 else obv.iloc[0]
+    obv_change = obv.iloc[-1] - obv_5d_ago
+    obv_price = close_series.iloc[-1]
+    ind['obv_trend'] = float(obv_change / obv_price) if obv_price > 0 else 0.0
+
+    # --- ATR Trend Direction (volatility expansion/contraction) ---
+    atr_10 = talib.ATR(high, low, close, timeperiod=10)  # type: ignore[arg-type]
+    atr_30 = talib.ATR(high, low, close, timeperiod=30)  # type: ignore[arg-type]
+    atr10_val = float(atr_10[-1]) if not np.isnan(atr_10[-1]) else 0.0
+    atr30_val = float(atr_30[-1]) if not np.isnan(atr_30[-1]) else 0.0
+    ind['atr_trend_ratio'] = atr10_val / atr30_val if atr30_val > 0 else 1.0
 
     return ind
 
@@ -318,14 +514,29 @@ def calculate_day_trade_score(
     vr = indicators.get('volume_ratio_1d', 1.0)
     comp['volume'] = min(vr / 2.0, 1.0)
 
+    # --- 8. OBV trend (5%) ---
+    obv = indicators.get('obv_trend', 0.0)
+    comp['obv'] = float(min(max(obv / 2.0, 0.0), 1.0))
+
+    # --- 9. ATR trend direction (5%) ---
+    atr_ratio = indicators.get('atr_trend_ratio', 1.0)
+    if atr_ratio > 1.1:
+        comp['atr_trend'] = min(1.0, (atr_ratio - 1.0) / 0.5)
+    elif atr_ratio < 0.9:
+        comp['atr_trend'] = 0.3
+    else:
+        comp['atr_trend'] = 0.6
+
     weights = {
-        'momentum': 0.30,
-        'acceleration': 0.15,
-        'gap': 0.15,
-        'rsi': 0.15,
+        'momentum': 0.25,
+        'acceleration': 0.12,
+        'gap': 0.12,
+        'rsi': 0.12,
         'squeeze': 0.10,
         'proximity': 0.10,
         'volume': 0.05,
+        'obv': 0.07,
+        'atr_trend': 0.07,
     }
     score = sum(comp[k] * w for k, w in weights.items())
     return min(max(score, 0.0), 1.0)
@@ -399,17 +610,66 @@ def calculate_short_term_score(
 
     # MACD histogram: positive = near-term upward acceleration
     comp['macd'] = 1.0 if indicators.get('macd_histogram', 0.0) > 0 else 0.0
+    # MACD crossover within last 3 days: strong entry signal
+    mc = indicators.get('macd_crossover', 0.0)
+    if mc > 0:
+        comp['macd_cross'] = 1.0
+    elif mc < 0:
+        comp['macd_cross'] = 0.0
+    else:
+        comp['macd_cross'] = 0.5
+
+    # VWAP proximity: price above VWAP = bullish short-term bias
+    vwap_dist = indicators.get('vwap_distance_pct', 0.0)
+    if vwap_dist > 0:
+        comp['vwap'] = min(1.0, vwap_dist / 2.0)  # +2% above VWAP = 1.0
+    else:
+        comp['vwap'] = max(0.3, 1.0 - abs(vwap_dist) / 2.0)  # below VWAP penalized, floor 0.3
+
+    # Chaikin Money Flow: positive = accumulation
+    cmf = indicators.get('cmf_20', 0.0)
+    comp['cmf'] = float(min(max(cmf / 0.3, 0.0), 1.0))  # 0.3 = strong accumulation
 
     # Volume confirmation: last 3 days vs 20-day average
     vr = indicators.get('volume_ratio_3d', 1.0)
     comp['volume'] = min(vr / 1.5, 1.0)
 
+    # Relative Volume: accounting for same-weekday baseline
+    rvol = indicators.get('rvol_5', 1.0)
+    comp['rvol'] = min(rvol / 2.0, 1.0)
+
+    # Momentum quality: ROC(5) > ROC(10) means accelerating momentum
+    mq = indicators.get('momentum_quality', 0.0)
+    # Normalize: +5% difference = 1.0, -5% = 0.0
+    comp['momentum_quality'] = float(min(max(mq / 5.0, 0.0), 1.0))
+
+    # OBV trend: positive OBV slope = accumulation
+    obv = indicators.get('obv_trend', 0.0)
+    # Normalize: OBV change > 2x price = strong accumulation
+    comp['obv'] = float(min(max(obv / 2.0, 0.0), 1.0))
+
+    # ATR trend direction: ratio > 1.1 = volatility expanding (breakout)
+    atr_ratio = indicators.get('atr_trend_ratio', 1.0)
+    if atr_ratio > 1.1:
+        comp['atr_trend'] = min(1.0, (atr_ratio - 1.0) / 0.5)  # 1.1→0.2, 1.5→1.0
+    elif atr_ratio < 0.9:
+        comp['atr_trend'] = 0.3  # contracting volatility = consolidation
+    else:
+        comp['atr_trend'] = 0.6  # neutral
+
     weights = {
-        'momentum': 0.35,
-        'structure': 0.25,
-        'rsi': 0.15,
-        'macd': 0.15,
-        'volume': 0.10,
+        'momentum': 0.20,
+        'structure': 0.16,
+        'rsi': 0.10,
+        'macd': 0.08,
+        'macd_cross': 0.06,
+        'vwap': 0.06,
+        'cmf': 0.06,
+        'volume': 0.06,
+        'rvol': 0.04,
+        'momentum_quality': 0.08,
+        'obv': 0.06,
+        'atr_trend': 0.04,
     }
     score = sum(comp[k] * w for k, w in weights.items())
     return min(max(score, 0.0), 1.0)
@@ -438,7 +698,8 @@ def calculate_4week_growth_outlook(
 
     Returns:
         Dict with keys: ``growth_score``, ``momentum``, ``sentiment``,
-        ``price_trend``, ``regime_adj``, ``volume``.
+        ``price_trend``, ``regime_adj``, ``volume``, ``obv_trend``,
+        ``atr_trend``, ``cmf``, ``rvol``.
     """
     if not short_term_indicators:
         return {
@@ -448,12 +709,16 @@ def calculate_4week_growth_outlook(
             'price_trend': 0.0,
             'regime_adj': 0.0,
             'volume': 0.0,
+            'obv_trend': 0.0,
+            'atr_trend': 0.0,
+            'cmf': 0.0,
+            'rvol': 0.0,
         }
 
     price = short_term_indicators.get('price', 0.0)
     atr5 = short_term_indicators.get('atr_5', 0.0)
 
-    # --- 1. Risk-adjusted relative momentum (35%) ---
+    # --- 1. Risk-adjusted relative momentum (30%) ---
     roc_5 = short_term_indicators.get('roc_5', 0.0)
     roc_10 = short_term_indicators.get('roc_10', 0.0)
     if spy_indicators:
@@ -477,20 +742,45 @@ def calculate_4week_growth_outlook(
     # +2% or more = 1.0, flat = 0.5, -2% or worse = 0.0
     price_trend = min(max((price_change_1w + 2.0) / 4.0, 0.0), 1.0)
 
-    # --- 4. Market regime adjustment (15%) ---
+    # --- 4. Market regime adjustment (10%) ---
     regime_map = {'bull': 1.0, 'sideways': 0.5, 'bear': 0.15}
     regime_adj = regime_map.get(market_regime, 0.5)
 
-    # --- 5. Volume confirmation (10%) ---
+    # --- 5. Volume confirmation (8%) ---
     vr = short_term_indicators.get('volume_ratio_3d', 1.0)
     volume = min(vr / 1.5, 1.0)
 
+    # --- 6. OBV trend (5%) — accumulation/distribution signal ---
+    obv = short_term_indicators.get('obv_trend', 0.0)
+    obv_score = float(min(max(obv / 2.0, 0.0), 1.0))
+
+    # --- 7. CMF (4%) — Chaikin Money Flow, volume-weighted accumulation ---
+    cmf = short_term_indicators.get('cmf_20', 0.0)
+    cmf_score = float(min(max(cmf / 0.3, 0.0), 1.0))
+
+    # --- 8. RVOL (3%) — relative volume vs same-weekday baseline ---
+    rvol = short_term_indicators.get('rvol_5', 1.0)
+    rvol_score = min(rvol / 2.0, 1.0)
+
+    # --- 9. ATR trend direction (5%) — volatility expansion/contraction ---
+    atr_ratio = short_term_indicators.get('atr_trend_ratio', 1.0)
+    if atr_ratio > 1.1:
+        atr_score = min(1.0, (atr_ratio - 1.0) / 0.5)
+    elif atr_ratio < 0.9:
+        atr_score = 0.3
+    else:
+        atr_score = 0.6
+
     weights = {
-        'momentum': 0.35,
-        'sentiment': 0.25,
+        'momentum': 0.28,
+        'sentiment': 0.22,
         'price_trend': 0.15,
-        'regime_adj': 0.15,
-        'volume': 0.10,
+        'regime_adj': 0.10,
+        'volume': 0.08,
+        'obv_trend': 0.05,
+        'cmf': 0.04,
+        'rvol': 0.03,
+        'atr_trend': 0.05,
     }
     components = {
         'momentum': momentum,
@@ -498,6 +788,10 @@ def calculate_4week_growth_outlook(
         'price_trend': price_trend,
         'regime_adj': regime_adj,
         'volume': volume,
+        'obv_trend': obv_score,
+        'cmf': cmf_score,
+        'rvol': rvol_score,
+        'atr_trend': atr_score,
     }
     growth_score = sum(components[k] * weights[k] for k in weights)
     growth_score = min(max(growth_score, 0.0), 1.0)

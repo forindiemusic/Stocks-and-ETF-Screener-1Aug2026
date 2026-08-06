@@ -122,6 +122,21 @@ backtest:
   # Alternative: specify components separately
   # slippage_bps: 5.0
   # bid_ask_spread_bps: 3.0
+  # Supported: off (neutral 0.5) or price_proxy (historical momentum proxy).
+  # Current live-news sentiment cannot be reconstructed historically.
+  sentiment_mode: "off"
+  # Modules tested one at a time by ETFBacktester.run_factor_ablation().
+  factor_ablation_factors: [technical, fundamental, sentiment, relative_strength]
+  # Backtest-only controls that affect selection, sizing, and simulated exits.
+  min_rank_score: 0.0
+  position_sizing_method: "equal" # equal or score_weighted
+  # Candidate profiles for train-only selection with run_out_of_sample_tuning().
+  # Do not use test-period results to choose a profile.
+  oos_tuning_profiles:
+    baseline: {}
+    tighter_exits:
+      stop_loss_atr_mult: 1.5
+      take_profit_atr_mult: 2.5
   # commission_per_share: 0.0
   composite_weights:
     technical: 0.50

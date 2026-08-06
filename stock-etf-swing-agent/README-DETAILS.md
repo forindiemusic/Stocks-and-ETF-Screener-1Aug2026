@@ -9,14 +9,15 @@ A Python-based agent that evaluates ETFs **and individual stocks** based on tech
 - **Configurable Universe**: Easily customize the ETF universe to screen
 - **Dual Asset Support**: Screen ETFs (`--mode etf`), stocks (`--mode stock`), or both (`--mode all`)
 - **Dual Horizon Support**: Choose between swing (`--horizon swing`, default) and day-trade (`--horizon day`) scoring
-- **Swing Stock Scoring**: Stocks ranked by days-scale score with relative strength vs SPY, risk-adjusted momentum, short MA structure, RSI(5), MACD histogram, and volume confirmation
-- **Day-Trade Stock Scoring**: Stocks ranked by ultra-short indicators — RSI(2), 1/2/3-day ROC, Bollinger squeeze, overnight gaps, momentum acceleration, and volume spikes
+- **Swing Stock Scoring**: Stocks ranked by days-scale score with relative strength vs SPY, risk-adjusted momentum, short MA structure, RSI(5), MACD histogram/crossover, VWAP proximity, Chaikin Money Flow, and volume confirmation
+- **Day-Trade Stock Scoring**: Stocks ranked by ultra-short indicators — RSI(2), 1/2/3-day ROC, Bollinger squeeze, overnight gaps, momentum acceleration, volume spikes, OBV trend, and ATR trend direction
 - **Dual Action Model**: Stocks use a score-based action (Strong Buy / Buy / Hold / Sell); ETFs use growth outlook as the primary recommendation with dividend-yield evaluation as supplementary context (e.g., "Buy | Yield: 3.74% (low) | Currently owned")
+- **Relative Strength Percentile Ranking**: Each symbol scored against its universe peers using percentile ranks for ROC, OBV, ATR trend, volume ratio, and ADX — blended at 20% into the final rank score
 - **Rotation Signals**: Tracks rankings across runs and flags symbols that have dropped significantly since the previous evaluation
 - **Risk Management**: Built-in position sizing and correlation limits; separate stop-loss/take-profit multipliers for day-trade mode
 - **CLI Output**: Clear, formatted output with rankings and scores
 - **Extensible Design**: Modular components for easy extension
-- **Modern Tooling**: Type hints (mypy strict), pre-commit hooks, GitHub Actions CI, pinned dependencies
+- **Modern Tooling**: Type hints (mypy strict — zero errors across all source files), pre-commit hooks, GitHub Actions CI, pinned dependencies
 
 ## Installation
 
@@ -66,7 +67,7 @@ python etf_and_stock_agent.py --config my_config.yaml
 # Screen only ETFs from config.yaml's etf_universe
 python etf_and_stock_agent.py --mode etf
 
-# Screen only stocks listed in corrently_own_stocks.dat
+# Screen only stocks listed in list_of_stocks_to_review_for_purchase.dat
 python etf_and_stock_agent.py --mode stock
 
 # Screen both ETFs and stocks (union of the two universes)
@@ -74,6 +75,10 @@ python etf_and_stock_agent.py --mode all
 
 # Screen ONLY the ETFs listed in currently_own_etf.dat (your holdings)
 python etf_and_stock_agent.py --mode owned-etf
+
+# Screen ONLY the stocks listed in currently_own_stocks.dat (your holdings)
+# Shows all with full detail, sorted by action (Buy > Hold > Sell)
+python etf_and_stock_agent.py --mode owned-stock
 
 # Day-trade horizon (1-5 day hold) — uses ultra-short indicators
 python etf_and_stock_agent.py --mode stock --horizon day
@@ -87,18 +92,19 @@ python test_agent.py
 | Mode | Universe source | Ranking |
 |------|----------------|---------|
 | `etf` (default in config) | `etf_universe` in `config.yaml` | Composite score |
-| `stock` | `corrently_own_stocks.dat` (one symbol per line) | **Short-term score** (swing) or **day-trade score** (day) |
+| `stock` | `list_of_stocks_to_review_for_purchase.dat` (one symbol per line) | **Short-term score** (swing) or **day-trade score** (day) |
 | `all` | Union of the above two | Composite score for ETFs, short-term/day-trade score for stocks |
 | `owned-etf` | `currently_own_etf.dat` (one symbol per line) | Composite score; never filtered by threshold |
+| `owned-stock` | `currently_own_stocks.dat` (one symbol per line) | Short-term/day-trade score; never filtered; sorted Buy > Hold > Sell |
 
-> Note: the stock file is named `corrently_own_stocks.dat` (intentional spelling). If the file is empty or missing, stock mode falls back to the config's `etf_universe`.
+> Note: the stock file is named `list_of_stocks_to_review_for_purchase.dat`. If the file is empty or missing, stock mode falls back to the config's `etf_universe`.
 
 ### Horizons
 
 | Horizon | Flag | Hold Period | Indicators | Score Threshold |
 |---------|------|-------------|------------|-----------------|
-| Swing (default) | `--horizon swing` | 3–20 days | RSI(5), ROC(5/10), SMA5/10/20, MACD, ATR(5) | 0.35 |
-| Day-trade | `--horizon day` | 1–5 days | RSI(2), ROC(1/2/3), Bollinger squeeze, gaps, ATR(2) | 0.30 |
+| Swing (default) | `--horizon swing` | 3–20 days | RSI(5), ROC(5/10), SMA5/10/20, MACD histogram/crossover, VWAP, CMF, RVOL, momentum quality, OBV trend, ATR trend | 0.35 |
+| Day-trade | `--horizon day` | 1–5 days | RSI(2), ROC(1/2/3), Bollinger squeeze, gaps, ATR(2), OBV trend, ATR trend, VWAP, CMF, RVOL | 0.30 |
 
 ## Output
 
@@ -106,7 +112,7 @@ The agent prints the **top 3 recommendations** with detailed metrics:
 
 - **Action** — score-based for stocks (Strong Buy / Buy / Hold / Sell); for ETFs: growth outlook primary | dividend-yield evaluation supplementary (e.g., "Buy | Yield: 3.74% (low) | Currently owned")
 - **Currently owned** — shown on the action line when the ETF is listed in `currently_own_etf.dat`
-- **4-Week Growth Outlook** (ETFs only) — price-appreciation potential from momentum, sentiment/demand, price trend, market regime, and volume
+- **4-Week Growth Outlook** (ETFs only) — price-appreciation potential from momentum, sentiment/demand, price trend, market regime, volume, OBV trend, CMF, RVOL, and ATR trend direction
 - **Day-Trade Score** (stocks, `--horizon day`) — 1–5 day ranking from ultra-short indicators
 - **Short-term Score** (stocks, `--horizon swing`) — days-scale, risk-adjusted, relative to SPY
 - Dividend yield (%)
@@ -177,7 +183,7 @@ XLE: Strong Buy | Yield: 3.74% (low) | Currently owned
    Dividend Yield : 3.74%
    Price          : $92.15 (1D: +0.87%, 1W: +2.33%)
    Stop-loss      : $88.42 | Take-profit: $97.73 (ATR: $1.87)
-   4-Week Growth   : 0.786 (Mom: 0.823, Sent: 0.514, Trend: 0.833, Regime: 1.000, Vol: 0.712)
+   4-Week Growth   : 0.786 (Mom: 0.823, Sent: 0.514, Trend: 0.833, Regime: 1.000, Vol: 0.712, OBV: 0.650, ATR: 0.720)
    Composite Score: 0.563 (Tech: 0.591, Fund: 0.480, Sent: 0.541)
    Sentiment Source: 8 news articles
    Regime         : bull (moderate vol)
@@ -186,7 +192,7 @@ XLF: Buy | Yield: 1.03% (low) | Currently owned
    Dividend Yield : 1.03%
    Price          : $58.22 (1D: +0.52%, 1W: +1.89%)
    Stop-loss      : $56.14 | Take-profit: $61.38 (ATR: $1.04)
-   4-Week Growth   : 0.677 (Mom: 0.745, Sent: 0.471, Trend: 0.722, Regime: 1.000, Vol: 0.598)
+   4-Week Growth   : 0.677 (Mom: 0.745, Sent: 0.471, Trend: 0.722, Regime: 1.000, Vol: 0.598, OBV: 0.550, ATR: 0.630)
    Composite Score: 0.568 (Tech: 0.583, Fund: 0.510, Sent: 0.520)
    Sentiment Source: 7 news articles
    Regime         : bull (moderate vol)
@@ -195,7 +201,7 @@ SPY: Hold | Yield: 0.76% (low)
    Dividend Yield : 0.76%
    Price          : $743.29 (1D: -0.99%, 1W: -0.78%)
    Stop-loss      : $726.22 | Take-profit: $768.89 (ATR: $8.53)
-   4-Week Growth   : 0.345 (Mom: 0.000, Sent: 0.337, Trend: 0.304, Regime: 1.000, Vol: 0.648)
+   4-Week Growth   : 0.345 (Mom: 0.000, Sent: 0.337, Trend: 0.304, Regime: 1.000, Vol: 0.648, OBV: 0.400, ATR: 0.500)
    Composite Score: 0.584 (Tech: 0.477, Fund: 0.796, Sent: 0.536)
    Sentiment Source: 9 news articles
    Regime         : bull (moderate vol)
@@ -234,11 +240,11 @@ redistributes to trend (0.35) and momentum (0.35), since mean-reversion
 penalizes trending stocks near upper Bollinger Bands.
 
 ### Technical Analysis (50% weight)
-- Trend: Price vs moving averages, MACD
-- Momentum: RSI, Rate of Change
-- Mean Reversion: Bollinger Bands position
-- Volume: Volume trends and OBV
-- Volatility: ATR and historical volatility
+- Trend: Price vs SMA50/200, SMA50 vs SMA200, MACD line/signal/histogram, MACD crossover (3-day), ADX
+- Momentum: RSI(14), Rate of Change (10/20-day), momentum quality
+- Mean Reversion: Bollinger Bands position (capped at 1.0)
+- Volume: Volume ratio, OBV trend, Chaikin Money Flow (CMF), relative volume (RVOL)
+- Volatility: ATR(14), ATR trend ratio (10/30), annualized 20-day volatility
 
 ### Fundamental Analysis (30% weight)
 - Expense ratio (lower is better)
@@ -266,6 +272,25 @@ proxy (no news found)" so you can assess signal quality at a glance.
 - Volatility regime (VIX levels)
 - Reported alongside results (currently informational; not a score weight)
 
+### Relative Strength Percentile Ranking
+
+After all symbols are evaluated, the agent computes a **composite relative strength score** by ranking each symbol against its peers in the evaluated universe. This ensures the final ranking reflects not just absolute quality but also relative standing.
+
+The process (in `run_screening()` and `_apply_relative_strength()`):
+
+1. Extract five key indicators from each symbol: `roc_10`, `obv_trend`, `atr_trend_ratio`, `volume_ratio`, `adx`
+2. Convert each indicator to a **percentile rank** (0.0–1.0) across the universe
+3. Combine the five percentile ranks into a single **composite relative strength** score (equal weight)
+4. Blend the relative strength into the final `_rank_score` at **20% weight**:
+
+   ```
+   _rank_score = base_score × 0.80 + relative_strength × 0.20
+   ```
+
+   Where `base_score` is the asset-appropriate primary score (short-term score for stocks, growth outlook for ETFs).
+
+This prevents a single strong indicator from dominating and rewards symbols that are consistently strong across multiple dimensions relative to their peers. The backtester mirrors this logic exactly.
+
 ### Short-Term Stock Scoring (stocks only, swing horizon)
 
 When running with `--mode stock --horizon swing` (or `all`), each stock is scored on a
@@ -273,14 +298,21 @@ When running with `--mode stock --horizon swing` (or `all`), each stock is score
 weeks. The score (0.0–1.0) is computed from a 1-month daily window in
 `indicators.py` (`calculate_short_term_indicators` + `calculate_short_term_score`):
 
-- **Risk-adjusted relative momentum (35%)**: 5-day and 10-day rate-of-change
+- **Risk-adjusted relative momentum (20%)**: 5-day and 10-day rate-of-change
   minus SPY's ROC, divided by ATR(5)/price. Rewards stocks that are
   outperforming the market on a risk-adjusted basis.
-- **Short MA structure (25%)**: price > SMA5 > SMA10 > SMA20 alignment
-- **RSI(5) (15%)**: prefers a healthy 40–75 zone (momentum without being
+- **Short MA structure (16%)**: price > SMA5 > SMA10 > SMA20 alignment
+- **Momentum quality (8%)**: ROC(5) − ROC(10); positive = accelerating momentum
+- **RSI(5) (10%)**: prefers a healthy 40–75 zone (momentum without being
   extremely overbought)
-- **MACD histogram (15%)**: positive = near-term upward acceleration
-- **Volume confirmation (10%)**: average of last 3 days vs 20-day average
+- **MACD histogram (8%)**: positive = near-term upward acceleration
+- **MACD crossover (6%)**: fresh bullish cross within 3 days = strong entry signal
+- **VWAP (6%)**: price above VWAP = bullish short-term bias
+- **Chaikin Money Flow (6%)**: positive = volume-weighted accumulation
+- **Volume confirmation (6%)**: average of last 3 days vs 20-day average
+- **Relative volume (4%)**: today's volume vs same-weekday 5-week average
+- **OBV trend (6%)**: positive OBV slope = accumulation
+- **ATR trend direction (4%)**: expanding volatility = breakout potential
 
 In `stock` mode the screening is **ranked by `short_term_score`**; ETFs (and
 `all` mode's ETF portion) continue to rank by the composite score above.
@@ -293,15 +325,15 @@ for catching moves over 1–3 days. The score (0.0–1.0) is computed from a
 ~2-week daily window in `indicators.py`
 (`calculate_day_trade_indicators` + `calculate_day_trade_score`):
 
-- **Risk-adjusted ultra-short momentum (30%)**: 1-day, 2-day, and 3-day
+- **Risk-adjusted ultra-short momentum (25%)**: 1-day, 2-day, and 3-day
   rate-of-change minus SPY's ROC, divided by ATR(2)/price. Captures the
   most recent price action with maximum sensitivity.
-- **Momentum acceleration (15%)**: ROC(1) minus ROC(3). Positive values mean
+- **Momentum acceleration (12%)**: ROC(1) minus ROC(3). Positive values mean
   the stock is getting stronger, not fading — a key day-trade signal.
-- **Gap analysis (15%)**: Overnight gap percentage and whether the gap
+- **Gap analysis (12%)**: Overnight gap percentage and whether the gap
   direction held through the trading day. Bullish gaps that hold score
   highest; gap-down reversals also score well.
-- **RSI(2) (15%)**: Ultra-sensitive 2-period RSI. Prefers the 30–70 zone
+- **RSI(2) (12%)**: Ultra-sensitive 2-period RSI. Prefers the 30–70 zone
   (not exhausted). Scores above 80 or below 20 are penalized.
 - **Bollinger squeeze (10%)**: Volatility contraction (narrow Bollinger
   Bands) often precedes explosive breakouts. Lower squeeze values = higher
@@ -310,6 +342,8 @@ for catching moves over 1–3 days. The score (0.0–1.0) is computed from a
   breakout is in progress; near the 5-day low suggests fading.
 - **Volume spike (5%)**: Today's volume vs 5-day average. Spikes confirm
   institutional interest.
+- **OBV trend (7%)**: On-Balance Volume slope over 5 days; accumulation = bullish
+- **ATR trend direction (7%)**: ATR(10) vs ATR(30) ratio; expanding volatility = breakout
 
 In `day` mode the screening is **ranked by `day_trade_score`** with a lower
 threshold (0.30) since day-trade scores cluster lower than swing scores.
@@ -321,15 +355,19 @@ dividends. The 4-week growth outlook estimates near-term price appreciation
 potential from non-dividend factors. It is computed in `indicators.py`
 (`calculate_4week_growth_outlook`) from a 1-month daily window:
 
-- **Risk-adjusted relative momentum (35%)**: 5-day and 10-day ROC vs SPY,
+- **Risk-adjusted relative momentum (28%)**: 5-day and 10-day ROC vs SPY,
   scaled by ATR(5)/price. Rewards ETFs outperforming the market on a
   risk-adjusted basis.
-- **Sentiment / demand proxy (25%)**: News sentiment score (0.0–1.0) from
+- **Sentiment / demand proxy (22%)**: News sentiment score (0.0–1.0) from
   TextBlob polarity analysis. Reflects market demand and narrative.
 - **1-week price trend (15%)**: Recent price direction; +2% or more = 1.0,
   flat = 0.5, -2% or worse = 0.0.
-- **Market regime (15%)**: Bull = 1.0, sideways = 0.5, bear = 0.15.
-- **Volume confirmation (10%)**: Average of last 3 days vs 20-day average.
+- **Market regime (10%)**: Bull = 1.0, sideways = 0.5, bear = 0.15.
+- **Volume confirmation (8%)**: Average of last 3 days vs 20-day average.
+- **OBV trend (5%)**: On-Balance Volume slope; accumulation = demand pressure.
+- **Chaikin Money Flow (4%)**: Volume-weighted accumulation/distribution.
+- **Relative volume (3%)**: Today's volume vs same-weekday 5-week average.
+- **ATR trend direction (5%)**: ATR(10) vs ATR(30) ratio; expanding volatility = breakout.
 
 The growth outlook is the **primary** ETF recommendation and ranking criteria,
 displayed first in the output. The dividend-yield evaluation follows as
@@ -362,9 +400,11 @@ configurable in the `day_trade` section of `config.yaml`.
 **ETFs** use a **growth-primary** recommendation model:
 
 1. **4-week growth outlook (primary)** — price-appreciation-focused; combines
-   risk-adjusted relative momentum (35%), news sentiment / demand proxy (25%),
-   1-week price trend (15%), market regime (15%), and volume confirmation (10%).
-   **ETFs are ranked by growth score** — Strong Buy > Buy > Hold > Sell.
+   risk-adjusted relative momentum (28%), news sentiment / demand proxy (22%),
+   1-week price trend (15%), market regime (10%), volume confirmation (8%),
+   OBV trend (5%), Chaikin Money Flow (4%), relative volume (3%), and ATR
+   trend direction (5%). **ETFs are ranked by growth score** — Strong Buy >
+   Buy > Hold > Sell.
 
 2. **Dividend-yield evaluation (supplementary)** — income-focused context;
    yield is labeled good (≥5.0%), standard (4.0–4.9%), or low (≤3.9%).
@@ -401,14 +441,6 @@ Each run saves rankings to `output/last_rankings.csv`. On the next run, any
 symbol that was previously in the top 5 but has dropped below the top 10 (or
 below a 0.30 score threshold) is flagged as a rotation exit candidate.
 
-## Disclaimer
-
-This tool is for educational and research purposes only. Past performance does not guarantee future results. Always conduct your own research and consider consulting with a financial advisor before making investment decisions.
-
-## License
-
-MIT
-
 ## Backtesting Framework
 
 The agent includes a comprehensive backtesting framework to validate strategy performance:
@@ -424,6 +456,21 @@ The agent includes a comprehensive backtesting framework to validate strategy pe
   stock-specific technical-weight profile and an 80/10/10 composite blend
   (ETF-centric fundamentals are down-weighted). ETFs are ranked by the
   4-week growth outlook (primary) with a composite-score fallback.
+- **Relative Strength Parity**: The backtester applies the same 20% relative-strength
+  percentile blend as the live agent via `_apply_relative_strength()`, ensuring
+  backtest rankings match live rankings.
+- **Next-Session Execution**: Signals form at the rebalance close and positions
+  enter at the next available session open; the signal-date bar is excluded
+  from stop-loss/take-profit evaluation.
+- **Reproducible Sentiment Modes**: Historical tests default to neutral
+  sentiment (`off`). An explicit `price_proxy` mode is available for research,
+  but is not a reconstruction of live-news sentiment.
+- **Walk-Forward Diagnostics**: Reports realized period results by bull,
+  sideways, bear, and unknown signal-date market regimes.
+- **Factor Ablation**: Tests technical, fundamental, sentiment, and
+  relative-strength modules one at a time against an unchanged baseline.
+- **Out-of-Sample Tuning**: Selects a candidate profile on training Sharpe
+  (then annual return) and evaluates it once on a non-overlapping test period.
 
 ### Usage
 ```bash
@@ -437,12 +484,117 @@ python3 backtest.py
 The `ETFBacktester` constructor accepts a `mode` argument (`'etf'`, `'stock'`,
 `'all'`, `'owned-etf'`) and an optional `stock_symbols` list. When `mode` is
 omitted but `etf_universe` is provided, it defaults to ETF behavior. In
-`'stock'` mode the universe is read from `corrently_own_stocks.dat` (falling
+`'stock'` mode the universe is read from `list_of_stocks_to_review_for_purchase.dat` (falling
 back to `config.yaml`'s `etf_universe`), and every symbol is treated as a
 stock. In `'all'` mode, stocks and ETFs are mixed and ranked on a common 0–1
 scale via `_rank_score_for()`.
 
-### Backtest Results Example
+### Backtest Execution Assumptions
+
+The backtester uses a conservative daily-bar timing model:
+
+1. Indicators and rankings are computed using the **rebalance-date close**.
+2. Selected symbols enter at the **first available next-session open**.
+3. The signal-date bar is excluded from holding-period returns and
+  stop-loss/take-profit checks.
+4. The SPY benchmark uses the same next-session-open to period-exit-close
+  interval.
+5. Transaction costs use configured one-way basis points; realized portfolio
+  returns use the configured position-sizing method.
+
+Daily OHLC bars cannot determine intraday ordering. When both a stop and a
+take-profit level occur in one bar, the backtester conservatively checks the
+stop first.
+
+### Sentiment in Historical Tests
+
+Current live-news sentiment cannot be reconstructed reliably for prior dates.
+The `backtest.sentiment_mode` setting isolates it from validated historical
+research:
+
+| Mode | Behavior | Recommended use |
+|------|----------|-----------------|
+| `off` | Neutral `0.5` sentiment; default | Primary strategy validation |
+| `price_proxy` | Maps trailing five-session price movement to 0–1 | Explicit experimental comparison only |
+
+`price_proxy` overlaps price-based technical momentum and is not a backtest of
+live news sentiment.
+
+### Factor Ablation and Regime Reporting
+
+Use `run_factor_ablation()` to compare the walk-forward baseline with one
+module neutralized at a time. Candidate modules are configured in
+`backtest.factor_ablation_factors`:
+
+| Scenario | Neutralization |
+|----------|----------------|
+| `technical` | Technical score set to `0.5` |
+| `fundamental` | Fundamental score set to `0.5` |
+| `sentiment` | Sentiment score set to `0.5` |
+| `relative_strength` | Removes the 20% percentile-rank overlay |
+
+The returned `comparison` includes mean annual-return and Sharpe deltas from
+the baseline; it does not optimize weights. Walk-forward results also include
+`regime_performance`: realized strategy return, benchmark return, excess
+return, and win rate grouped by the signal-date market regime.
+
+### Out-of-Sample Tuning Workflow
+
+Use `run_out_of_sample_tuning()` to evaluate candidate weights, thresholds,
+sizing, and exits without choosing them from the period used to judge them:
+
+1. Define a small, pre-committed set of profiles in
+  `backtest.oos_tuning_profiles`.
+2. Run every profile on a **training** interval.
+3. Select highest training Sharpe, breaking ties by training annual return.
+4. Freeze the selected profile and run it once on a later, non-overlapping
+  **test** interval.
+
+Profiles may change only `composite_weights`, `top_n`, `min_rank_score`, ATR
+stop/take-profit multiples, and `position_sizing_method` (`equal` or
+`score_weighted`). Test-period results must not be used to select a profile.
+
+```python
+from datetime import datetime
+from backtest import ETFBacktester
+
+backtester = ETFBacktester(config_path="config.yaml")
+report = backtester.run_out_of_sample_tuning(
+   train_start=datetime(2021, 1, 1),
+   train_end=datetime(2023, 12, 31),
+   test_start=datetime(2024, 1, 1),
+   test_end=datetime(2025, 12, 31),
+   rebalancing_freq="M",
+)
+print(report["selected_profile"])
+print(report["test"])
+```
+
+### Backtest Configuration
+
+Relevant `config.yaml` settings:
+
+```yaml
+backtest:
+  sentiment_mode: "off"            # off or price_proxy
+  min_rank_score: 0.0              # filter before correlation filtering
+  position_sizing_method: "equal"  # equal or score_weighted
+  factor_ablation_factors:
+   - technical
+   - fundamental
+   - sentiment
+   - relative_strength
+  oos_tuning_profiles:
+   baseline: {}
+   tighter_exits:
+    stop_loss_atr_mult: 1.5
+    take_profit_atr_mult: 2.5
+```
+
+### Illustrative Backtest Output
+
+The values below demonstrate the output format only. They are not a current
+performance claim, investment recommendation, or forecast.
 ```
 BACKTEST RESULTS
 ==================================================
@@ -527,7 +679,7 @@ python3 -m pytest tests/ --cov=src --cov-report=term-missing
 
 ### Type Checking
 ```bash
-python3 -m mypy etf_and_stock_agent.py indicators.py scoring.py retry.py
+python3 -m mypy etf_and_stock_agent.py indicators.py scoring.py retry.py backtest.py
 ```
 
 ### Linting
@@ -539,6 +691,9 @@ ruff check src tests
 ruff format --check src tests
 ```
 
+- Rebalancing frequency: Change to 'D' (daily), 'W' (weekly), or 'M' (monthly)
+- Lookback period: Modify how much historical data is used for evaluation
+
 ## Disclaimer
 
 This tool is for educational and research purposes only. Past performance does not guarantee future results. Always conduct your own research and consider consulting with a financial advisor before making investment decisions.
@@ -546,8 +701,6 @@ This tool is for educational and research purposes only. Past performance does n
 ## License
 
 MIT
-- Rebalancing frequency: Change to 'D' (daily), 'W' (weekly), or 'M' (monthly)
-- Lookback period: Modify how much historical data is used for evaluation
 
 ## Platform-Specific Installation
 

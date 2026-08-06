@@ -8,11 +8,13 @@ import yfinance as yf
 import yaml
 from datetime import datetime, timedelta
 import logging
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, Iterator, List, Tuple, Optional, Any
 import warnings
 import requests
 import re
 from collections import OrderedDict
+from contextlib import contextmanager
+from copy import deepcopy
 warnings.filterwarnings('ignore', category=FutureWarning, module='ta')
 
 # Valid ETF symbol pattern
@@ -47,7 +49,7 @@ from indicators import (
     calculate_short_term_score,
     calculate_4week_growth_outlook,
 )
-from scoring import calculate_technical_score, calculate_fundamental_score
+from scoring import calculate_technical_score, calculate_fundamental_score, compute_composite_relative_strength
 from retry import retry_call
 
 # Setup logging
@@ -57,9 +59,9 @@ logger = logging.getLogger(__name__)
 class ETFBacktester:
     """Backtester for ETF Swing Trading Agent strategy."""
     
-    def __init__(self, etf_universe: List[str] = None, lookback_months: int = 6,
+    def __init__(self, etf_universe: Optional[List[str]] = None, lookback_months: int = 6,
                  config_path: str = "config.yaml", mode: str = "etf",
-                 stock_symbols: List[str] = None):
+                 stock_symbols: Optional[List[str]] = None):
         """
         Initialize the backtester.
 
@@ -69,7 +71,7 @@ class ETFBacktester:
 
         Args:
             etf_universe: List of symbols to consider. If None, derived from
-                ``mode`` (config etf_universe, corrently_own_stocks.dat, or
+                ``mode`` (config etf_universe, list_of_stocks_to_review_for_purchase.dat, or
                 currently_own_etf.dat).
             lookback_months: Months of historical data to use for evaluation
             config_path: Path to YAML configuration file
@@ -88,7 +90,7 @@ class ETFBacktester:
         # --- Universe derivation (mirrors ETFSwingAgent.__init__) ---
         if etf_universe is None:
             if mode == "stock":
-                etf_universe = _load_symbols_from_file('corrently_own_stocks.dat')
+                etf_universe = _load_symbols_from_file('list_of_stocks_to_review_for_purchase.dat')
                 if not etf_universe:
                     etf_universe = config['etf_universe']
             elif mode == "owned-etf":
@@ -101,7 +103,7 @@ class ETFBacktester:
                 etf_universe = owned
             elif mode == "all":
                 etf_symbols = set(config['etf_universe'])
-                stock_syms = set(_load_symbols_from_file('corrently_own_stocks.dat'))
+                stock_syms = set(_load_symbols_from_file('list_of_stocks_to_review_for_purchase.dat'))
                 etf_universe = list(etf_symbols.union(stock_syms))
             else:  # 'etf'
                 etf_universe = config['etf_universe']
@@ -134,19 +136,47 @@ class ETFBacktester:
         })
         self.benchmark_symbol = bt_config.get('benchmark_symbol', 'SPY')
         self.top_n = bt_config.get('top_n', 5)
+        self.min_rank_score = float(bt_config.get('min_rank_score', 0.0))
+        self.position_sizing_method = bt_config.get('position_sizing_method', 'equal')
+        if self.position_sizing_method not in {'equal', 'score_weighted'}:
+            raise ValueError(
+                "backtest.position_sizing_method must be 'equal' or 'score_weighted'."
+            )
+        self.oos_tuning_profiles: Dict[str, Dict[str, Any]] = bt_config.get(
+            'oos_tuning_profiles', {}
+        )
+        self.sentiment_mode = bt_config.get('sentiment_mode', 'off')
+        if self.sentiment_mode not in {'off', 'price_proxy'}:
+            raise ValueError(
+                "backtest.sentiment_mode must be 'off' or 'price_proxy'. "
+                "Historical live-news sentiment is not reproducible."
+            )
+        configured_factors = bt_config.get(
+            'factor_ablation_factors',
+            ['technical', 'fundamental', 'sentiment', 'relative_strength'],
+        )
+        valid_factors = {'technical', 'fundamental', 'sentiment', 'relative_strength'}
+        invalid_factors = set(configured_factors) - valid_factors
+        if invalid_factors:
+            raise ValueError(
+                "backtest.factor_ablation_factors contains unsupported factor(s): "
+                f"{', '.join(sorted(invalid_factors))}"
+            )
+        self.factor_ablation_factors: List[str] = list(configured_factors)
+        self._ablated_factors: set[str] = set()
         
         # Transaction cost config
         total_txn = bt_config.get('total_txn_cost_bps', 0.0)
         if total_txn > 0:
-            self.txn_cost_bps = total_txn
+            self.txn_cost_bps: float = float(total_txn)
         else:
-            self.txn_cost_bps = (
+            self.txn_cost_bps = float(
                 bt_config.get('slippage_bps', 5.0) +
                 bt_config.get('bid_ask_spread_bps', 3.0) +
                 bt_config.get('commission_per_share', 0.0) * 0  # per-share ignored in bps model
             )
         # Convert bps to decimal (e.g., 8 bps -> 0.0008)
-        self.txn_cost = self.txn_cost_bps / 10000.0
+        self.txn_cost: float = self.txn_cost_bps / 10000.0
         
         # Track previous holdings for turnover calculation
         self._prev_holdings: Optional[List[str]] = None
@@ -201,7 +231,7 @@ class ETFBacktester:
             if age < ttl:
                 # Move to end for LRU (most recently used)
                 self._data_cache.move_to_end(cache_key)
-                return entry['data']
+                return entry['data']  # type: ignore[no-any-return]
             else:
                 # Remove expired entry
                 del self._data_cache[cache_key]
@@ -220,13 +250,13 @@ class ETFBacktester:
                 del self._data_cache[oldest_key]
             
             self._data_cache[cache_key] = {'data': data, 'fetched_at': now}
-            return data
+            return data  # type: ignore[no-any-return]
         except Exception as e:
             logger.error(f"Error fetching data for {symbol} after retries: {e}")
             return None
 
     def fetch_historical_data(self, symbol: str, end_date: datetime, 
-                            period_months: int = None) -> pd.DataFrame:
+                            period_months: Optional[int] = None) -> Optional[pd.DataFrame]:
         """
         Fetch historical data for an ETF up to a specific end date.
         
@@ -245,7 +275,7 @@ class ETFBacktester:
         return self._fetch_window(symbol, start_date, end_date)
     
     def fetch_period_data(self, symbol: str, start_date: datetime,
-                          end_date: datetime) -> pd.DataFrame:
+                          end_date: datetime) -> Optional[pd.DataFrame]:
         """
         Fetch historical data for an ETF between two specific dates.
         
@@ -265,18 +295,17 @@ class ETFBacktester:
     
     def get_sentiment_score(self, symbol: str, end_date: datetime) -> float:
         """
-        Get sentiment score for an ETF (price-based momentum proxy for backtesting).
+        Get the configured reproducible backtest sentiment score.
 
-        IMPORTANT — signal divergence from the live agent:
-        The live agent (etf_and_stock_agent.py) computes sentiment from *current* news via
-        TextBlob polarity. This backtester instead uses a 1-month price-momentum
-        proxy because historical news is not available. As a result, the
-        sentiment component tested here is NOT the same signal used live, so
-        backtest performance of the sentiment factor should be interpreted with
-        caution. Technical and fundamental factors ARE consistent between the two.
+        ``off`` returns the neutral 0.5 score and is the default because the
+        live agent's current-news TextBlob score is not historically
+        reproducible. ``price_proxy`` uses trailing price movement as an
+        explicitly separate, reproducible experimental factor.
         """
-        # For backtesting, we'll use a simple price momentum as a proxy for sentiment
-        # This is not ideal but avoids the need for historical news data
+        if self.sentiment_mode == 'off':
+            return 0.5
+
+        # Explicit historical price-momentum proxy; this is not live-news sentiment.
         data = self.fetch_historical_data(symbol, end_date, period_months=1)
         if data is None or len(data) < 5:
             return 0.5
@@ -287,7 +316,40 @@ class ETFBacktester:
         # Convert return to sentiment score (0-1)
         # -5% return = 0.0, +5% return = 1.0
         sentiment = 0.5 + recent_return * 10
-        return min(max(sentiment, 0), 1)
+        return float(min(max(sentiment, 0), 1))
+
+    @staticmethod
+    def _filter_holding_window(
+        data: pd.DataFrame,
+        signal_date: datetime,
+        exit_date: datetime,
+    ) -> pd.DataFrame:
+        """Return bars strictly after the signal close through the exit date."""
+        signal_ts = pd.Timestamp(signal_date).normalize()
+        exit_ts = pd.Timestamp(exit_date).normalize()
+        normalized_index = pd.DatetimeIndex(data.index).normalize()
+        return data.loc[(normalized_index > signal_ts) & (normalized_index <= exit_ts)]
+
+    def _get_next_session_entry(
+        self,
+        symbol: str,
+        signal_date: datetime,
+        exit_date: datetime,
+    ) -> Optional[Tuple[float, datetime]]:
+        """Return the first tradable next-session open after a signal close."""
+        data = self.fetch_period_data(symbol, signal_date, exit_date + timedelta(days=1))
+        if data is None or data.empty:
+            return None
+
+        holding_data = self._filter_holding_window(data, signal_date, exit_date)
+        if holding_data.empty:
+            return None
+
+        entry_row = holding_data.iloc[0]
+        entry_price = float(entry_row['Open'])
+        if not np.isfinite(entry_price) or entry_price <= 0:
+            return None
+        return entry_price, holding_data.index[0].to_pydatetime()
     
     def _get_market_regime(self, end_date: datetime) -> Dict[str, Any]:
         """
@@ -356,6 +418,8 @@ class ETFBacktester:
         # Calculate components
         technical_indicators = calculate_technical_indicators(data)
         technical_score = calculate_technical_score(technical_indicators, self.technical_weights)
+        if 'technical' in self._ablated_factors:
+            technical_score = 0.5
         
         # Fetch benchmark data for tracking error calculation
         bench_data = self.fetch_historical_data(self.benchmark_symbol, end_date)
@@ -363,6 +427,10 @@ class ETFBacktester:
             symbol, self.fundamental_weights, price_data=data, benchmark_data=bench_data
         )
         sentiment_score = self.get_sentiment_score(symbol, end_date)
+        if 'fundamental' in self._ablated_factors:
+            fundamental_score = 0.5
+        if 'sentiment' in self._ablated_factors:
+            sentiment_score = 0.5
         
         # Composite score using config weights
         composite_score = (
@@ -378,10 +446,10 @@ class ETFBacktester:
         
         # --- 4-week growth outlook (PRIMARY ranking criteria, matches live agent) ---
         growth_outlook = None
-        short_data = self.fetch_historical_data(symbol, end_date, period_months=1)
+        short_data = self.fetch_historical_data(symbol, end_date, period_months=6)
         if short_data is not None and len(short_data) >= 20:
             short_ind = calculate_short_term_indicators(short_data)
-            spy_short = self.fetch_historical_data(self.benchmark_symbol, end_date, period_months=1)
+            spy_short = self.fetch_historical_data(self.benchmark_symbol, end_date, period_months=6)
             spy_ind = calculate_short_term_indicators(spy_short) if (spy_short is not None and len(spy_short) >= 20) else None
             regime = self._get_market_regime(end_date)
             growth_outlook = calculate_4week_growth_outlook(
@@ -423,6 +491,7 @@ class ETFBacktester:
             "current_price": current_price,
             "price_change_1w": price_change_1w,
             "atr": atr,
+            "technical_indicators": technical_indicators,
             "data_points": len(data)
         }
 
@@ -451,6 +520,8 @@ class ETFBacktester:
         stock_tech_weights['momentum_score'] = 0.35
         stock_tech_weights['trend_score'] = 0.35
         technical_score = calculate_technical_score(technical_indicators, stock_tech_weights)
+        if 'technical' in self._ablated_factors:
+            technical_score = 0.5
 
         # Fetch benchmark data for tracking error / relative strength
         bench_data = self.fetch_historical_data(self.benchmark_symbol, end_date)
@@ -459,6 +530,10 @@ class ETFBacktester:
             benchmark_data=bench_data, is_stock=True
         )
         sentiment_score = self.get_sentiment_score(symbol, end_date)
+        if 'fundamental' in self._ablated_factors:
+            fundamental_score = 0.5
+        if 'sentiment' in self._ablated_factors:
+            sentiment_score = 0.5
 
         # Composite: stocks use 80/10/10 (ETF-centric fields are meaningless)
         composite_score = (
@@ -474,10 +549,10 @@ class ETFBacktester:
 
         # --- Short-term (days-scale) score — PRIMARY ranking criteria for stocks ---
         short_term_score = 0.0
-        short_data = self.fetch_historical_data(symbol, end_date, period_months=1)
+        short_data = self.fetch_historical_data(symbol, end_date, period_months=6)
         if short_data is not None and len(short_data) >= 20:
             short_ind = calculate_short_term_indicators(short_data)
-            spy_short = self.fetch_historical_data(self.benchmark_symbol, end_date, period_months=1)
+            spy_short = self.fetch_historical_data(self.benchmark_symbol, end_date, period_months=6)
             spy_ind = calculate_short_term_indicators(spy_short) if (spy_short is not None and len(spy_short) >= 20) else None
             short_term_score = calculate_short_term_score(short_ind, spy_indicators=spy_ind)
 
@@ -571,6 +646,7 @@ class ETFBacktester:
         for i in range(len(rebalancing_dates) - 1):
             current_date = rebalancing_dates[i]
             next_date = rebalancing_dates[i + 1]
+            period_regime = self._get_market_regime(current_date).get('regime', 'unknown')
             
             logger.info(f"Rebalancing on {current_date.date()}")
             
@@ -588,8 +664,21 @@ class ETFBacktester:
 
             # Rank by asset-appropriate score (stocks: short_term_score;
             # ETFs: growth_score primary, composite fallback). Mirrors the
-            # live agent's run_screening() ranking.
-            etf_scores.sort(key=self._rank_score_for, reverse=True)
+            # live agent's run_screening() ranking, including the 20%
+            # relative-strength percentile blend.
+            self._apply_relative_strength(etf_scores)
+            etf_scores.sort(key=lambda x: x['_rank_score'], reverse=True)
+
+            eligible_scores = [
+                score for score in etf_scores
+                if score['_rank_score'] >= self.min_rank_score
+            ]
+            if not eligible_scores and etf_scores:
+                logger.info(
+                    "No symbols met min_rank_score=%.3f; retaining the top candidate.",
+                    self.min_rank_score,
+                )
+                eligible_scores = etf_scores[:1]
 
             # Log diagnostic info: how many symbols scored and the threshold
             etf_threshold = self.risk_config.get('min_score_threshold', 0.55)
@@ -599,8 +688,8 @@ class ETFBacktester:
                 f"(etf_thresh={etf_threshold:.2f}, stock_thresh={stock_threshold:.2f})"
             )
 
-            filtered_scores = self._apply_correlation_filter(etf_scores, current_date)
-            logger.info(f"  After correlation filter: {len(filtered_scores)} symbols (removed {len(etf_scores) - len(filtered_scores)})")
+            filtered_scores = self._apply_correlation_filter(eligible_scores, current_date)
+            logger.info(f"  After correlation filter: {len(filtered_scores)} symbols (removed {len(eligible_scores) - len(filtered_scores)})")
 
             # Apply minimum holding period logic to reduce turnover
             top_etfs = self._apply_holding_period_filter(filtered_scores, current_date)
@@ -612,7 +701,7 @@ class ETFBacktester:
             # Log selected symbols with their ranking scores
             if top_etfs:
                 selected_str = ', '.join(
-                    f'{e["symbol"]}(rank={self._rank_score_for(e):.3f})'
+                    f'{e["symbol"]}(rank={e.get("_rank_score", self._rank_score_for(e)):.3f})'
                     for e in top_etfs
                 )
                 logger.info(f"  Selected: {selected_str}")
@@ -630,15 +719,19 @@ class ETFBacktester:
                 stop_loss_hits = 0
                 take_profit_hits = 0
             else:
-                # Calculate period return for each ETF in the top N
-                # with stop-loss / take-profit simulation
+                # Signals use the rebalance close. Trades enter at the first
+                # next-session open; no same-close execution is permitted.
                 period_returns = []
                 stop_loss_hits = 0
                 take_profit_hits = 0
                 for etf in top_etfs:
                     symbol = etf['symbol']
-                    entry_price = etf['current_price']
                     atr = etf.get('atr', 0.0)
+                    entry = self._get_next_session_entry(symbol, current_date, next_date)
+                    if entry is None:
+                        logger.warning(f"No next-session entry available for {symbol} on {current_date.date()}")
+                        continue
+                    entry_price, _entry_date = entry
                     
                     etf_return = self._simulate_stop_loss_take_profit(
                         symbol, entry_price, atr, current_date, next_date
@@ -655,23 +748,36 @@ class ETFBacktester:
                     
                     period_returns.append(etf_return)
                 
-                # Equal-weighted portfolio return (gross, before transaction costs)
+                # Apply selected portfolio weights to realized returns.
                 if period_returns:
-                    gross_return = np.mean(period_returns)
+                    executed_weights = [
+                        float(etf.get('position_pct', 0.0))
+                        for etf in top_etfs[:len(period_returns)]
+                    ]
+                    if len(executed_weights) == len(period_returns) and sum(executed_weights) > 0:
+                        gross_return = float(np.average(period_returns, weights=executed_weights))
+                    else:
+                        gross_return = float(np.mean(period_returns))
                 else:
                     gross_return = 0.0
                 
                 # Apply transaction costs to get net return
                 period_return = gross_return - period_txn_cost
                 
-                # Calculate benchmark return for the same period
-                spy_data = self.fetch_period_data(self.benchmark_symbol, current_date, next_date)
-                if spy_data is None or len(spy_data) < 2:
+                # Benchmark uses the identical next-session-open to exit-close window.
+                spy_data = self.fetch_period_data(
+                    self.benchmark_symbol, current_date, next_date + timedelta(days=1)
+                )
+                if spy_data is None or spy_data.empty:
                     benchmark_period_return = 0.0
                 else:
-                    spy_start = spy_data['Close'].iloc[0]
-                    spy_end = spy_data['Close'].iloc[-1]
-                    benchmark_period_return = (spy_end / spy_start) - 1
+                    holding_spy = self._filter_holding_window(spy_data, current_date, next_date)
+                    if holding_spy.empty:
+                        benchmark_period_return = 0.0
+                    else:
+                        spy_start = holding_spy['Open'].iloc[0]
+                        spy_end = holding_spy['Close'].iloc[-1]
+                        benchmark_period_return = (spy_end / spy_start) - 1
             
             strategy_returns.append(period_return)
             benchmark_returns.append(benchmark_period_return)
@@ -679,7 +785,10 @@ class ETFBacktester:
             # Record holdings for this period
             portfolio_history.append({
                 'rebalancing_date': current_date,
+                'market_regime': period_regime,
                 'holdings': new_holdings,
+                'execution_assumption': 'next_session_open_to_exit_close',
+                'sentiment_mode': self.sentiment_mode,
                 'scores': [etf['composite_score'] for etf in top_etfs],
                 'growth_scores': [
                     etf.get('growth_outlook', {}).get('growth_score', 0.0)
@@ -738,8 +847,8 @@ class ETFBacktester:
         winning_periods = [r for r in strategy_returns if r > 0]
         losing_periods = [r for r in strategy_returns if r < 0]
         win_rate = len(winning_periods) / len(strategy_returns) if strategy_returns else 0
-        avg_win = np.mean(winning_periods) if winning_periods else 0
-        avg_loss = abs(np.mean(losing_periods)) if losing_periods else 0
+        avg_win = float(np.mean(winning_periods)) if winning_periods else 0.0
+        avg_loss = float(abs(np.mean(losing_periods))) if losing_periods else 0.0
         win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else (float('inf') if avg_win > 0 else 0)
         
         # Information ratio: excess return over benchmark / tracking error
@@ -765,8 +874,8 @@ class ETFBacktester:
         
         # Prepare results
         total_txn_cost_sum = sum(total_txn_costs)
-        total_stop_loss_hits = sum(p.get('stop_loss_hits', 0) for p in portfolio_history)
-        total_take_profit_hits = sum(p.get('take_profit_hits', 0) for p in portfolio_history)
+        total_stop_loss_hits = sum(int(p.get('stop_loss_hits', 0)) for p in portfolio_history)  # type: ignore[call-overload]
+        total_take_profit_hits = sum(int(p.get('take_profit_hits', 0)) for p in portfolio_history)  # type: ignore[call-overload]
         results = {
             'start_date': start_date,
             'end_date': end_date,
@@ -847,7 +956,7 @@ class ETFBacktester:
         # Each changed position costs txn_cost * (1/n) of portfolio
         # Both selling old and buying new incur costs
         turnover_fraction = total_changes / n
-        return turnover_fraction * self.txn_cost
+        return float(turnover_fraction * self.txn_cost)
     
     def _calc_avg_turnover(self, portfolio_history: List[Dict]) -> float:
         """Calculate average turnover percentage across all periods."""
@@ -865,7 +974,7 @@ class ETFBacktester:
             if n > 0:
                 turnovers.append(changes / n)
         
-        return np.mean(turnovers) * 100 if turnovers else 0.0
+        return float(np.mean(turnovers)) * 100 if turnovers else 0.0
     
     def _rank_score_for(self, result: Dict[str, Any]) -> float:
         """Compute the ranking score for a single evaluated symbol.
@@ -874,14 +983,62 @@ class ETFBacktester:
         (days-scale), ETFs rank by ``growth_score`` (primary) with a
         ``composite_score`` fallback when growth is unavailable. Both are on a
         0–1 scale so they are comparable in 'all' mode.
+
+        Note: The live agent blends a 20% relative-strength percentile into
+        the rank score. The backtester applies that blend batch-wide in
+        ``_apply_relative_strength()`` before sorting (since percentiles are
+        universe-relative and can't be computed per-symbol).
         """
         symbol = result.get('symbol')
         if symbol in self._stock_symbols:
-            return result.get('short_term_score', 0.0)
+            return float(result.get('short_term_score', 0.0))  # type: ignore[no-any-return]
         growth = result.get('growth_outlook')
         if growth and growth.get('growth_score', 0.0) > 0:
-            return growth['growth_score']
-        return result.get('composite_score', 0.0)
+            return float(growth['growth_score'])  # type: ignore[no-any-return]
+        return float(result.get('composite_score', 0.0))  # type: ignore[no-any-return]
+
+    def _apply_relative_strength(self, results: List[Dict[str, Any]]) -> None:
+        """Blend relative-strength percentiles into each result's rank score.
+
+        Mirrors the live agent's run_screening(): computes percentile ranks
+        for key technical indicators across the evaluated universe, then
+        blends the composite relative strength into a per-symbol
+        ``_relative_strength`` and ``_rank_score`` at 20% weight.
+
+        Mutates ``results`` in place. Call before sorting.
+        If technical_indicators are not available (e.g., test data), falls
+        back to the base rank score with neutral relative strength.
+        """
+        if 'relative_strength' in self._ablated_factors:
+            for r in results:
+                r['_relative_strength'] = 0.5
+                r['_rank_score'] = self._rank_score_for(r)
+            return
+
+        if len(results) < 3:
+            for r in results:
+                r['_relative_strength'] = 0.5
+                r['_rank_score'] = self._rank_score_for(r)
+            return
+
+        indicator_sets: Dict[str, Dict[str, float]] = {}
+        for key in ('roc_10', 'obv_trend', 'atr_trend_ratio', 'volume_ratio', 'adx'):
+            vals = {}
+            for r in results:
+                tech = r.get('technical_indicators', {})
+                if tech and key in tech and tech[key] is not None:
+                    vals[r['symbol']] = tech[key]
+            if vals:
+                indicator_sets[key] = vals
+
+        rs_percentiles = compute_composite_relative_strength(indicator_sets)
+
+        rs_weight = 0.20
+        for r in results:
+            rs = rs_percentiles.get(r['symbol'], 0.5)
+            r['_relative_strength'] = rs
+            base = self._rank_score_for(r)
+            r['_rank_score'] = base * (1 - rs_weight) + rs * rs_weight
 
     def _apply_correlation_filter(self, etf_scores: List[Dict], end_date: datetime) -> List[Dict]:
         """
@@ -959,7 +1116,8 @@ class ETFBacktester:
         """
         # Always rank by the asset-appropriate score before selecting, so the
         # function is self-contained and matches the live agent's ranking.
-        etf_scores = sorted(etf_scores, key=self._rank_score_for, reverse=True)
+        self._apply_relative_strength(etf_scores)
+        etf_scores = sorted(etf_scores, key=lambda x: x['_rank_score'], reverse=True)
 
         if not self._prev_holdings:
             return etf_scores[:self.top_n]
@@ -976,7 +1134,8 @@ class ETFBacktester:
                     etf['composite_score'] += score_boost
         
         # Re-sort after boosting using the asset-appropriate rank key
-        etf_scores.sort(key=self._rank_score_for, reverse=True)
+        self._apply_relative_strength(etf_scores)
+        etf_scores.sort(key=lambda x: x['_rank_score'], reverse=True)
         
         # Update holding periods
         for etf in etf_scores[:self.top_n]:
@@ -992,8 +1151,7 @@ class ETFBacktester:
     
     def _apply_position_sizing(self, results: List[Dict]) -> None:
         """
-        Assign a position weight to each selected ETF, capped at max_position_pct.
-        Matches the live agent's position sizing logic.
+        Assign position weights using the configured sizing method.
         
         Args:
             results: List of selected ETF results to mutate in place
@@ -1002,12 +1160,36 @@ class ETFBacktester:
         n = len(results)
         if n == 0:
             return
-        
-        # Equal weight capped at max_position_pct, then normalize to 100%
+
+        if self.position_sizing_method == 'score_weighted':
+            raw_weights = [max(float(r.get('_rank_score', 0.0)), 0.0) for r in results]
+            total = sum(raw_weights)
+            if total > 0:
+                normalized = [weight / total for weight in raw_weights]
+                # Cap exposures and redistribute any remaining budget among
+                # positions still below the cap.
+                weights = [min(weight, max_pct) for weight in normalized]
+                remaining = 1.0 - sum(weights)
+                while remaining > 1e-8:
+                    eligible = [i for i, weight in enumerate(weights) if weight < max_pct - 1e-8]
+                    if not eligible:
+                        break
+                    allocation = remaining / len(eligible)
+                    added = 0.0
+                    for i in eligible:
+                        increment = min(allocation, max_pct - weights[i])
+                        weights[i] += increment
+                        added += increment
+                    remaining -= added
+                for result, weight in zip(results, weights):
+                    result['position_pct'] = round(weight, 4)
+                return
+
+        # Equal weight capped at max_position_pct, then normalized to 100%.
         raw_weight = min(1.0 / n, max_pct)
         total = raw_weight * n
-        for r in results:
-            r['position_pct'] = round(raw_weight / total, 4)  # sums to ~1.0
+        for result in results:
+            result['position_pct'] = round(raw_weight / total, 4)
     
     def _simulate_stop_loss_take_profit(
         self, symbol: str, entry_price: float, atr: float,
@@ -1035,10 +1217,13 @@ class ETFBacktester:
         """
         if atr <= 0:
             # No ATR available, fall back to simple period return
-            price_data = self.fetch_period_data(symbol, current_date, next_date)
-            if price_data is None or len(price_data) < 2:
+            price_data = self.fetch_period_data(symbol, current_date, next_date + timedelta(days=1))
+            if price_data is None or price_data.empty:
                 return 0.0
-            return (price_data['Close'].iloc[-1] / entry_price) - 1
+            price_data = self._filter_holding_window(price_data, current_date, next_date)
+            if price_data.empty:
+                return 0.0
+            return float((price_data['Close'].iloc[-1] / entry_price) - 1)
         
         # Market-regime aware stop-loss: wider stops in bull markets
         regime = self._get_market_regime(current_date)
@@ -1051,9 +1236,13 @@ class ETFBacktester:
         stop_loss = entry_price - stop_mult * atr
         take_profit = entry_price + self.take_profit_atr_mult * atr
         
-        # Fetch daily data ONLY for the holding period (current_date → next_date)
-        price_data = self.fetch_period_data(symbol, current_date, next_date)
+        # Fetch only the post-entry holding window. The signal-date bar is
+        # excluded because its close was used to form the signal.
+        price_data = self.fetch_period_data(symbol, current_date, next_date + timedelta(days=1))
         if price_data is None or len(price_data) < 2:
+            return 0.0
+        price_data = self._filter_holding_window(price_data, current_date, next_date)
+        if price_data.empty:
             return 0.0
         
         # Walk through daily prices to check for stop/take-profit triggers
@@ -1063,15 +1252,15 @@ class ETFBacktester:
             
             # Check stop-loss first (risk management priority)
             if low_price <= stop_loss:
-                return (stop_loss / entry_price) - 1
+                return float((stop_loss / entry_price) - 1)
             
             # Check take-profit
             if high_price >= take_profit:
-                return (take_profit / entry_price) - 1
+                return float((take_profit / entry_price) - 1)
         
         # Neither triggered — use full period return
         end_price = price_data['Close'].iloc[-1]
-        return (end_price / entry_price) - 1
+        return float((end_price / entry_price) - 1)
     
     @staticmethod
     def _fmt_ratio(value: float) -> str:
@@ -1082,7 +1271,7 @@ class ETFBacktester:
             return '-∞'
         return f'{value:.2f}'
     
-    def print_backtest_summary(self, results: Dict[str, Any]):
+    def print_backtest_summary(self, results: Dict[str, Any]) -> None:
         """Print a formatted summary of backtest results."""
         if "error" in results:
             print(f"Backtest failed: {results['error']}")
@@ -1183,7 +1372,8 @@ class ETFBacktester:
         if len(all_scores) < 5:
             return {"error": "Not enough valid symbols for baseline"}
         
-        all_scores.sort(key=self._rank_score_for, reverse=True)
+        self._apply_relative_strength(all_scores)
+        all_scores.sort(key=lambda x: x['_rank_score'], reverse=True)
         baseline_symbols = [e['symbol'] for e in all_scores[:5]]
         
         # Calculate baseline returns (simple equal-weight, no stop-loss/take-profit)
@@ -1216,6 +1406,211 @@ class ETFBacktester:
             'naive_baseline_annual_return': baseline_annual,
             'naive_baseline_sharpe': baseline_sharpe,
             'naive_baseline_symbols': baseline_symbols,
+        }
+
+    @staticmethod
+    def _summarize_regime_performance(
+        windows: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, float]]:
+        """Aggregate realized period returns by the signal-date market regime."""
+        observations: Dict[str, List[Tuple[float, float]]] = {}
+        for window in windows:
+            for period in window.get('portfolio_history', []):
+                regime = str(period.get('market_regime', 'unknown'))
+                observations.setdefault(regime, []).append((
+                    float(period.get('period_return', 0.0)),
+                    float(period.get('benchmark_return', 0.0)),
+                ))
+
+        summary: Dict[str, Dict[str, float]] = {}
+        for regime, values in observations.items():
+            strategy_returns = [value[0] for value in values]
+            benchmark_returns = [value[1] for value in values]
+            summary[regime] = {
+                'periods': float(len(values)),
+                'mean_strategy_return': float(np.mean(strategy_returns)),
+                'mean_benchmark_return': float(np.mean(benchmark_returns)),
+                'mean_excess_return': float(np.mean([
+                    strategy - benchmark
+                    for strategy, benchmark in values
+                ])),
+                'win_rate': float(np.mean([ret > 0 for ret in strategy_returns])),
+            }
+        return summary
+
+    def run_factor_ablation(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        window_months: int = 12,
+        step_months: int = 3,
+        rebalancing_freq: str = 'M',
+        factors: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Run a walk-forward baseline and one neutralized-factor scenario per module.
+
+        Each ablation replaces a module with its neutral value while preserving
+        all execution, universe, and risk-management rules. Results should be
+        compared out of sample; this report does not optimize weights.
+        """
+        requested = factors if factors is not None else self.factor_ablation_factors
+        invalid = set(requested) - set(self.factor_ablation_factors)
+        if invalid:
+            return {'error': f"Unsupported ablation factor(s): {', '.join(sorted(invalid))}"}
+
+        previous = set(self._ablated_factors)
+        scenarios: Dict[str, Dict[str, Any]] = {}
+        try:
+            self._ablated_factors = set()
+            scenarios['baseline'] = self.run_walk_forward(
+                start_date, end_date, window_months, step_months, rebalancing_freq
+            )
+            for factor in requested:
+                self._ablated_factors = {factor}
+                scenarios[f'without_{factor}'] = self.run_walk_forward(
+                    start_date, end_date, window_months, step_months, rebalancing_freq
+                )
+        finally:
+            self._ablated_factors = previous
+
+        baseline = scenarios['baseline']
+        if 'error' in baseline:
+            return {'error': f"Baseline ablation run failed: {baseline['error']}"}
+
+        comparison: Dict[str, Dict[str, float]] = {}
+        baseline_return = float(baseline['mean_annual_return'])
+        baseline_sharpe = float(baseline['mean_sharpe'])
+        for name, result in scenarios.items():
+            if name == 'baseline' or 'error' in result:
+                continue
+            comparison[name] = {
+                'mean_annual_return': float(result['mean_annual_return']),
+                'mean_sharpe': float(result['mean_sharpe']),
+                'return_delta_vs_baseline': float(result['mean_annual_return']) - baseline_return,
+                'sharpe_delta_vs_baseline': float(result['mean_sharpe']) - baseline_sharpe,
+            }
+
+        return {
+            'baseline': baseline,
+            'scenarios': scenarios,
+            'comparison': comparison,
+            'factors': requested,
+        }
+
+    @contextmanager
+    def _tuning_profile(self, profile: Dict[str, Any]) -> Iterator[None]:
+        """Temporarily apply a validated candidate profile to the backtester."""
+        allowed = {
+            'composite_weights', 'top_n', 'min_rank_score',
+            'stop_loss_atr_mult', 'take_profit_atr_mult',
+            'position_sizing_method',
+        }
+        unsupported = set(profile) - allowed
+        if unsupported:
+            raise ValueError(
+                f"Unsupported tuning profile setting(s): {', '.join(sorted(unsupported))}"
+            )
+
+        previous = {
+            'composite_weights': deepcopy(self.composite_weights),
+            'top_n': self.top_n,
+            'min_rank_score': self.min_rank_score,
+            'stop_loss_atr_mult': self.stop_loss_atr_mult,
+            'take_profit_atr_mult': self.take_profit_atr_mult,
+            'position_sizing_method': self.position_sizing_method,
+        }
+        try:
+            if 'composite_weights' in profile:
+                weights = profile['composite_weights']
+                if not isinstance(weights, dict) or set(weights) != {
+                    'technical', 'fundamental', 'sentiment'
+                }:
+                    raise ValueError("composite_weights must define technical, fundamental, and sentiment")
+                if not np.isclose(sum(float(weight) for weight in weights.values()), 1.0):
+                    raise ValueError("tuning profile composite_weights must sum to 1.0")
+                self.composite_weights = {key: float(value) for key, value in weights.items()}
+            if 'top_n' in profile:
+                self.top_n = max(1, int(profile['top_n']))
+            if 'min_rank_score' in profile:
+                self.min_rank_score = float(profile['min_rank_score'])
+            if 'stop_loss_atr_mult' in profile:
+                self.stop_loss_atr_mult = float(profile['stop_loss_atr_mult'])
+            if 'take_profit_atr_mult' in profile:
+                self.take_profit_atr_mult = float(profile['take_profit_atr_mult'])
+            if 'position_sizing_method' in profile:
+                method = str(profile['position_sizing_method'])
+                if method not in {'equal', 'score_weighted'}:
+                    raise ValueError("position_sizing_method must be 'equal' or 'score_weighted'")
+                self.position_sizing_method = method
+            yield
+        finally:
+            self.composite_weights = previous['composite_weights']
+            self.top_n = previous['top_n']
+            self.min_rank_score = previous['min_rank_score']
+            self.stop_loss_atr_mult = previous['stop_loss_atr_mult']
+            self.take_profit_atr_mult = previous['take_profit_atr_mult']
+            self.position_sizing_method = previous['position_sizing_method']
+
+    def run_out_of_sample_tuning(
+        self,
+        train_start: datetime,
+        train_end: datetime,
+        test_start: datetime,
+        test_end: datetime,
+        rebalancing_freq: str = 'M',
+        profiles: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Select a frozen profile on training data, then evaluate it once out of sample.
+
+        Candidate profiles are never fitted on the test range. Selection uses
+        training Sharpe ratio, then annual return as a deterministic tie-break.
+        The returned ``test`` result is the only performance result that should
+        be used to judge the chosen profile.
+        """
+        if train_end >= test_start:
+            return {'error': 'Training period must end before the test period begins'}
+
+        candidates = profiles if profiles is not None else self.oos_tuning_profiles
+        if not candidates:
+            return {'error': 'No out-of-sample tuning profiles configured'}
+
+        training_results: Dict[str, Dict[str, Any]] = {}
+        for name, profile in candidates.items():
+            try:
+                with self._tuning_profile(profile):
+                    training_results[name] = self.run_backtest(
+                        train_start, train_end, rebalancing_freq
+                    )
+            except ValueError as error:
+                training_results[name] = {'error': str(error)}
+
+        viable = [
+            (name, result) for name, result in training_results.items()
+            if 'error' not in result
+        ]
+        if not viable:
+            return {'error': 'All training profile runs failed', 'training': training_results}
+
+        selected_name, selected_train = max(
+            viable,
+            key=lambda item: (
+                float(item[1].get('strategy_sharpe_ratio', float('-inf'))),
+                float(item[1].get('strategy_annual_return', float('-inf'))),
+            ),
+        )
+        selected_profile = candidates[selected_name]
+        with self._tuning_profile(selected_profile):
+            test_result = self.run_backtest(test_start, test_end, rebalancing_freq)
+
+        return {
+            'selected_profile': selected_name,
+            'selected_settings': deepcopy(selected_profile),
+            'selection_metric': 'training_sharpe_then_annual_return',
+            'training': training_results,
+            'selected_training_result': selected_train,
+            'test': test_result,
+            'train_period': {'start': train_start, 'end': train_end},
+            'test_period': {'start': test_start, 'end': test_end},
         }
 
     def run_walk_forward(
@@ -1286,13 +1681,13 @@ class ETFBacktester:
         beat_benchmark = sum(1 for s, b in zip(annual_returns, bench_returns) if s > b)
 
         # Filter out inf values for mean calculation
-        def safe_mean(values):
+        def safe_mean(values: List[float]) -> float:
             finite = [v for v in values if v != float('inf') and v != float('-inf')]
-            return np.mean(finite) if finite else 0.0
+            return float(np.mean(finite)) if finite else 0.0
 
-        def safe_std(values):
+        def safe_std(values: List[float]) -> float:
             finite = [v for v in values if v != float('inf') and v != float('-inf')]
-            return np.std(finite) if len(finite) > 1 else 0.0
+            return float(np.std(finite)) if len(finite) > 1 else 0.0
 
         aggregated = {
             'num_windows': len(window_results),
@@ -1326,10 +1721,11 @@ class ETFBacktester:
             # Consistency score: % of windows with positive return
             'pct_profitable_windows': sum(1 for r in annual_returns if r > 0) / len(window_results),
         }
+        aggregated['regime_performance'] = self._summarize_regime_performance(window_results)
 
         return aggregated
 
-    def print_walk_forward_summary(self, results: Dict[str, Any]):
+    def print_walk_forward_summary(self, results: Dict[str, Any]) -> None:
         """Print a formatted summary of walk-forward validation results."""
         if "error" in results:
             print(f"Walk-forward failed: {results['error']}")
@@ -1359,6 +1755,21 @@ class ETFBacktester:
         print(f"  Mean excess return: {results['mean_excess_return']:.2%}")
         print(f"  Benchmark mean ret: {results['mean_benchmark_return']:.2%}")
         print("-" * 70)
+        print("REGIME-SEGMENTED PERIOD RETURNS:")
+        regime_performance = results.get('regime_performance', {})
+        if regime_performance:
+            for regime, metrics in sorted(regime_performance.items()):
+                periods = int(metrics['periods'])
+                print(
+                    f"  {regime:<9} periods={periods:<3} "
+                    f"strategy={metrics['mean_strategy_return']:.2%}  "
+                    f"benchmark={metrics['mean_benchmark_return']:.2%}  "
+                    f"excess={metrics['mean_excess_return']:.2%}  "
+                    f"win-rate={metrics['win_rate']:.0%}"
+                )
+        else:
+            print("  No regime observations available.")
+        print("-" * 70)
         print("WINDOW DETAILS:")
         for w in results['windows']:
             beat = "✓" if w['strategy_annual_return'] > w['benchmark_annual_return'] else "✗"
@@ -1369,7 +1780,7 @@ class ETFBacktester:
         print("=" * 70)
 
 
-def run_sample_backtest():
+def run_sample_backtest() -> Dict[str, Any]:
     """Run a sample backtest for demonstration."""
     # Define backtest period (last 2 years)
     end_date = datetime.now()

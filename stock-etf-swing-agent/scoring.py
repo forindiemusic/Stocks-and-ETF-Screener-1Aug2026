@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 # Valid ETF symbol pattern
 VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9._-]{1,10}$')
 
+# Relative-strength inputs reward greater confirmed momentum, accumulation,
+# liquidity participation, trend strength, and volatility expansion. A symbol
+# is only admitted to the candidate universe after its asset-specific score
+# has evaluated price direction; the percentile overlay therefore ranks the
+# strength of the confirmation signals themselves.
+RELATIVE_STRENGTH_HIGHER_IS_BETTER = {
+    'roc_10': True,
+    'obv_trend': True,
+    'atr_trend_ratio': True,
+    'volume_ratio': True,
+    'adx': True,
+}
+
 
 def validate_etf_symbol(symbol: str) -> bool:
     """Validate ETF symbol format."""
@@ -64,6 +77,13 @@ def calculate_technical_score(
         trend_signals.append(min(indicators['sma50_vs_sma200'] * 10, 1.0))
     if indicators.get('macd_histogram', 0) > 0:
         trend_signals.append(0.5)
+    # MACD crossover: fresh bullish cross within 3 days = strong entry signal.
+    # Only include when an actual crossover occurred (0 = no crossover = neutral).
+    mc = indicators.get('macd_crossover', 0.0)
+    if mc > 0:
+        trend_signals.append(1.0)
+    elif mc < 0:
+        trend_signals.append(0.0)
     # ADX: strong trend (>25) is good for swing trading, very strong (>40) is ideal
     adx = indicators.get('adx', 20)
     if adx >= 25:
@@ -87,7 +107,12 @@ def calculate_technical_score(
     # Mean Reversion Score
     mean_rev_signals = []
     bb_pos = indicators.get('bb_position', 0.5)
-    mean_rev_signals.append(1.0 - abs(bb_pos - 0.5) * 2)
+    # Cap bb_pos at 1.0 for mean reversion scoring — when price is above the
+    # upper band (bb_pos > 1.0) the penalty should not exceed the penalty for
+    # being exactly at the upper band. This avoids over-penalizing strong
+    # breakouts that may still be valid entries.
+    bb_pos_capped = min(bb_pos, 1.0)
+    mean_rev_signals.append(1.0 - abs(bb_pos_capped - 0.5) * 2)
 
     price_vs_sma20 = (indicators.get('price', 0) / indicators.get('sma_20', 1) - 1) if indicators.get('sma_20', 0) > 0 else 0
     mean_rev_signals.append(max(0, 1 - abs(price_vs_sma20) * 20))
@@ -97,6 +122,15 @@ def calculate_technical_score(
     volume_signals = []
     vol_ratio = indicators.get('volume_ratio', 1)
     volume_signals.append(min(vol_ratio / 2, 1.0))
+    # OBV trend: positive OBV slope = accumulation = bullish volume confirmation
+    obv = indicators.get('obv_trend', 0.0)
+    volume_signals.append(float(min(max(obv / 2.0, 0.0), 1.0)))
+    # Chaikin Money Flow: positive = accumulation
+    cmf = indicators.get('cmf_20', 0.0)
+    volume_signals.append(float(min(max(cmf / 0.3, 0.0), 1.0)))
+    # Relative Volume: elevated vs same-weekday baseline
+    rvol = indicators.get('rvol_5', 1.0)
+    volume_signals.append(min(rvol / 2.0, 1.0))
     score_components['volume'] = float(np.mean([max(0, x) for x in volume_signals]) if volume_signals else 0.0)
 
     # Volatility Score
@@ -108,6 +142,14 @@ def calculate_technical_score(
         vol_signals.append(vol_20 / 0.15)
     else:
         vol_signals.append(max(0, 0.5 - (vol_20 - 0.35) / 0.35))
+    # ATR trend direction: expanding volatility (ratio > 1.1) = breakout potential
+    atr_ratio = indicators.get('atr_trend_ratio', 1.0)
+    if atr_ratio > 1.1:
+        vol_signals.append(min(1.0, (atr_ratio - 1.0) / 0.5))  # 1.1→0.2, 1.5→1.0
+    elif atr_ratio < 0.9:
+        vol_signals.append(0.3)  # contracting = consolidation
+    else:
+        vol_signals.append(0.6)  # neutral
     score_components['volatility'] = float(np.mean([max(0, x) for x in vol_signals]) if vol_signals else 0.0)
 
     # Calculate weighted score
@@ -281,7 +323,7 @@ def _compute_tracking_error(
 
     try:
         etf_returns = price_data['Close'].pct_change(fill_method=None).dropna()
-        bench_returns = benchmark_data['Close'].pct_change().dropna()
+        bench_returns = benchmark_data['Close'].pct_change(fill_method=None).dropna()
 
         # Align on common dates
         common_idx = etf_returns.index.intersection(bench_returns.index)
@@ -360,3 +402,91 @@ def _compute_sharpe_1y(price_data: Optional[pd.DataFrame] = None) -> float:
     except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError) as e:
         logger.debug(f"Sharpe computation error: {e}")
         return 0.6
+
+
+def compute_percentile_rank(
+    values: Dict[str, float],
+    key: str,
+    higher_is_better: bool = True,
+) -> Dict[str, float]:
+    """
+    Compute percentile rank for a given indicator across all symbols.
+
+    This enables relative strength scoring — each symbol's score reflects
+    its standing within the evaluated universe rather than an absolute value.
+
+    Args:
+        values: Dictionary mapping symbol -> indicator value
+        key: Description of the indicator (for logging)
+        higher_is_better: If True, higher values get higher percentiles.
+                          If False, lower values get higher percentiles.
+
+    Returns:
+        Dictionary mapping symbol -> percentile rank (0.0 to 1.0).
+        Returns 0.5 for all symbols if fewer than 3 values are available.
+    """
+    if not values or len(values) < 3:
+        return {sym: 0.5 for sym in values}
+
+    sorted_syms = sorted(values.items(), key=lambda x: x[1], reverse=higher_is_better)
+    n = len(sorted_syms)
+    percentiles: Dict[str, float] = {}
+
+    for rank, (sym, _) in enumerate(sorted_syms):
+        # Percentile rank: (n - rank - 1) / (n - 1) → 1.0 for best, 0.0 for worst
+        percentiles[sym] = (n - rank - 1) / (n - 1) if n > 1 else 0.5
+
+    return percentiles
+
+
+def compute_composite_relative_strength(
+    indicator_sets: Dict[str, Dict[str, float]],
+    weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """
+    Compute a composite relative strength score from multiple indicator percentiles.
+
+    Takes multiple indicator dictionaries (e.g., roc_10, obv_trend, atr_trend_ratio),
+    converts each to percentile ranks, then combines them with the given weights.
+
+    Args:
+        indicator_sets: Dict mapping indicator_name -> {symbol: value}
+        weights: Dict mapping indicator_name -> weight. Defaults to equal weights.
+
+    Returns:
+        Dict mapping symbol -> composite relative strength score (0.0 to 1.0).
+    """
+    if not indicator_sets:
+        return {}
+
+    if weights is None:
+        weights = {k: 1.0 / len(indicator_sets) for k in indicator_sets}
+
+    # Compute percentile ranks for each indicator. All currently used
+    # relative-strength factors are confirmation signals where higher is
+    # stronger. Unknown factors preserve the conventional higher-is-better
+    # ordering unless a caller supplies pre-transformed values.
+    percentiles: Dict[str, Dict[str, float]] = {}
+    for name, values in indicator_sets.items():
+        higher_is_better = RELATIVE_STRENGTH_HIGHER_IS_BETTER.get(name, True)
+        percentiles[name] = compute_percentile_rank(
+            values, name, higher_is_better=higher_is_better
+        )
+
+    # Combine all symbols
+    all_symbols: set = set()
+    for p in percentiles.values():
+        all_symbols.update(p.keys())
+
+    composite: Dict[str, float] = {}
+    for sym in all_symbols:
+        score = 0.0
+        total_w = 0.0
+        for name, p_vals in percentiles.items():
+            w = weights.get(name, 0)
+            if sym in p_vals:
+                score += p_vals[sym] * w
+                total_w += w
+        composite[sym] = score / total_w if total_w > 0 else 0.5
+
+    return composite

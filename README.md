@@ -4,15 +4,11 @@ I took a class on machine learning a few years ago.  I used the course as an opp
 
 A couple of months ago I started to build AI Agents.  I used the newly acquired information to revisit my old project.
 
-This project is a result of that work.
-
-I used the following LLMs with the most current release:
+Used the following LLMs with the most current release:
 
 1 - NVIDIA: Nemotron 3 Super - Was used to review my initial project, improve methods and enhance data collection sources.
 
-
 2 - DeepSeek: V4 Pro - Was used to review the project and improve the code.  It discovered 17 items that needed attention.
-
 
 3 - Poolside: Laguna M.1 - Was used to review the project with focus on security and vulnerabilities.
 
@@ -21,6 +17,8 @@ I used the following LLMs with the most current release:
 5 - Anthropic: Claude Opus 4.8 - Implemented Additional Code Improvements
 
 6 - GitHub Copilot (DeepSeek V4 Flash) - Implemented day-trade horizon (--horizon day), modern tooling (pyproject.toml, pre-commit, CI), type hints, and comprehensive documentation. 
+
+7 - OpenAI GPT-5.6 Terra - Fixed relative-strength directions and add tests.  Corrected VWAP/RVOL horizon behavior.  Eliminated backtest timing leakage and isolated sentiment modes.  Added factor-ablation plus regime-segmented walk-forward reporting.  Tuned weights, thresholds, position sizing, and exits based on out-of-sample evidence.
 
 The project was designed to use free sources for financial news and information.  
 

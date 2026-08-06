@@ -32,12 +32,13 @@ class TestCalculateTechnicalIndicators:
         expected_keys = {
             'sma_20', 'sma_50', 'sma_200', 'price',
             'price_vs_sma50', 'price_vs_sma200', 'sma50_vs_sma200',
-            'macd', 'macd_signal', 'macd_histogram',
+            'macd', 'macd_signal', 'macd_histogram', 'macd_crossover',
             'rsi', 'adx',
             'bb_upper', 'bb_lower', 'bb_position',
             'roc_10', 'roc_20',
             'volume_sma_20', 'volume_ratio',
-            'atr_14', 'volatility_20',
+            'atr_14', 'atr_trend_ratio', 'obv_trend', 'volatility_20',
+            'vwap', 'vwap_distance_pct', 'cmf_20', 'rvol_5',
         }
         assert set(result.keys()) == expected_keys
 
@@ -98,6 +99,56 @@ class TestCalculateTechnicalIndicators:
         expected = last_20_returns.std() * np.sqrt(252)
         assert abs(result['volatility_20'] - expected) < 0.01
 
+    def test_vwap_uses_trailing_twenty_sessions(self):
+        """Old bars must not distort the daily rolling VWAP reference."""
+        dates = pd.date_range('2025-01-01', periods=50, freq='B')
+        typical_price = np.full(50, 100.0)
+        typical_price[0] = 1_000.0
+        df = pd.DataFrame({
+            'Open': typical_price,
+            'High': typical_price,
+            'Low': typical_price,
+            'Close': typical_price,
+            'Volume': np.full(50, 1_000_000.0),
+        }, index=dates)
+
+        result = calculate_technical_indicators(df)
+
+        assert result['vwap'] == pytest.approx(100.0)
+        assert result['vwap_distance_pct'] == pytest.approx(0.0)
+
+    def test_rvol_compares_five_prior_matching_weekdays(self):
+        """RVOL uses only the previous five occurrences of today's weekday."""
+        dates = pd.date_range('2025-01-06', periods=51, freq='W-MON')
+        volume = np.full(51, 100.0)
+        volume[-1] = 200.0
+        prices = np.full(51, 100.0)
+        df = pd.DataFrame({
+            'Open': prices,
+            'High': prices + 1,
+            'Low': prices - 1,
+            'Close': prices,
+            'Volume': volume,
+        }, index=dates)
+
+        result = calculate_technical_indicators(df)
+
+        assert result['rvol_5'] == pytest.approx(2.0)
+
+    def test_rvol_is_neutral_without_dated_weekday_history(self):
+        prices = np.full(50, 100.0)
+        df = pd.DataFrame({
+            'Open': prices,
+            'High': prices + 1,
+            'Low': prices - 1,
+            'Close': prices,
+            'Volume': np.full(50, 200.0),
+        })
+
+        result = calculate_technical_indicators(df)
+
+        assert result['rvol_5'] == 1.0
+
     def test_all_values_finite(self, sample_ohlcv_data):
         result = calculate_technical_indicators(sample_ohlcv_data)
         for key, value in result.items():
@@ -120,7 +171,9 @@ class TestCalculateShortTermIndicators:
         expected_keys = {
             'price', 'sma_5', 'sma_10', 'sma_20',
             'roc_5', 'roc_10', 'rsi_5',
-            'macd_histogram', 'volume_ratio_3d', 'atr_5',
+            'macd_histogram', 'macd_crossover', 'volume_ratio_3d', 'atr_5',
+            'momentum_quality', 'obv_trend', 'atr_trend_ratio',
+            'vwap', 'vwap_distance_pct', 'cmf_20', 'rvol_5',
         }
         assert set(result.keys()) == expected_keys
 
@@ -215,6 +268,8 @@ class TestCalculateDayTradeIndicators:
             'rsi_2', 'bb_width', 'bb_squeeze',
             'high_5', 'low_5', 'proximity_high_5',
             'volume_ratio_1d', 'intraday_range_pct', 'atr_2',
+            'obv_trend', 'atr_trend_ratio',
+            'vwap', 'vwap_distance_pct', 'cmf_20', 'rvol_5',
         }
         assert set(result.keys()) == expected_keys
 
