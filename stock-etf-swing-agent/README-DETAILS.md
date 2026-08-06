@@ -459,6 +459,18 @@ The agent includes a comprehensive backtesting framework to validate strategy pe
 - **Relative Strength Parity**: The backtester applies the same 20% relative-strength
   percentile blend as the live agent via `_apply_relative_strength()`, ensuring
   backtest rankings match live rankings.
+- **Next-Session Execution**: Signals form at the rebalance close and positions
+  enter at the next available session open; the signal-date bar is excluded
+  from stop-loss/take-profit evaluation.
+- **Reproducible Sentiment Modes**: Historical tests default to neutral
+  sentiment (`off`). An explicit `price_proxy` mode is available for research,
+  but is not a reconstruction of live-news sentiment.
+- **Walk-Forward Diagnostics**: Reports realized period results by bull,
+  sideways, bear, and unknown signal-date market regimes.
+- **Factor Ablation**: Tests technical, fundamental, sentiment, and
+  relative-strength modules one at a time against an unchanged baseline.
+- **Out-of-Sample Tuning**: Selects a candidate profile on training Sharpe
+  (then annual return) and evaluates it once on a non-overlapping test period.
 
 ### Usage
 ```bash
@@ -477,7 +489,112 @@ back to `config.yaml`'s `etf_universe`), and every symbol is treated as a
 stock. In `'all'` mode, stocks and ETFs are mixed and ranked on a common 0–1
 scale via `_rank_score_for()`.
 
-### Backtest Results Example
+### Backtest Execution Assumptions
+
+The backtester uses a conservative daily-bar timing model:
+
+1. Indicators and rankings are computed using the **rebalance-date close**.
+2. Selected symbols enter at the **first available next-session open**.
+3. The signal-date bar is excluded from holding-period returns and
+  stop-loss/take-profit checks.
+4. The SPY benchmark uses the same next-session-open to period-exit-close
+  interval.
+5. Transaction costs use configured one-way basis points; realized portfolio
+  returns use the configured position-sizing method.
+
+Daily OHLC bars cannot determine intraday ordering. When both a stop and a
+take-profit level occur in one bar, the backtester conservatively checks the
+stop first.
+
+### Sentiment in Historical Tests
+
+Current live-news sentiment cannot be reconstructed reliably for prior dates.
+The `backtest.sentiment_mode` setting isolates it from validated historical
+research:
+
+| Mode | Behavior | Recommended use |
+|------|----------|-----------------|
+| `off` | Neutral `0.5` sentiment; default | Primary strategy validation |
+| `price_proxy` | Maps trailing five-session price movement to 0–1 | Explicit experimental comparison only |
+
+`price_proxy` overlaps price-based technical momentum and is not a backtest of
+live news sentiment.
+
+### Factor Ablation and Regime Reporting
+
+Use `run_factor_ablation()` to compare the walk-forward baseline with one
+module neutralized at a time. Candidate modules are configured in
+`backtest.factor_ablation_factors`:
+
+| Scenario | Neutralization |
+|----------|----------------|
+| `technical` | Technical score set to `0.5` |
+| `fundamental` | Fundamental score set to `0.5` |
+| `sentiment` | Sentiment score set to `0.5` |
+| `relative_strength` | Removes the 20% percentile-rank overlay |
+
+The returned `comparison` includes mean annual-return and Sharpe deltas from
+the baseline; it does not optimize weights. Walk-forward results also include
+`regime_performance`: realized strategy return, benchmark return, excess
+return, and win rate grouped by the signal-date market regime.
+
+### Out-of-Sample Tuning Workflow
+
+Use `run_out_of_sample_tuning()` to evaluate candidate weights, thresholds,
+sizing, and exits without choosing them from the period used to judge them:
+
+1. Define a small, pre-committed set of profiles in
+  `backtest.oos_tuning_profiles`.
+2. Run every profile on a **training** interval.
+3. Select highest training Sharpe, breaking ties by training annual return.
+4. Freeze the selected profile and run it once on a later, non-overlapping
+  **test** interval.
+
+Profiles may change only `composite_weights`, `top_n`, `min_rank_score`, ATR
+stop/take-profit multiples, and `position_sizing_method` (`equal` or
+`score_weighted`). Test-period results must not be used to select a profile.
+
+```python
+from datetime import datetime
+from backtest import ETFBacktester
+
+backtester = ETFBacktester(config_path="config.yaml")
+report = backtester.run_out_of_sample_tuning(
+   train_start=datetime(2021, 1, 1),
+   train_end=datetime(2023, 12, 31),
+   test_start=datetime(2024, 1, 1),
+   test_end=datetime(2025, 12, 31),
+   rebalancing_freq="M",
+)
+print(report["selected_profile"])
+print(report["test"])
+```
+
+### Backtest Configuration
+
+Relevant `config.yaml` settings:
+
+```yaml
+backtest:
+  sentiment_mode: "off"            # off or price_proxy
+  min_rank_score: 0.0              # filter before correlation filtering
+  position_sizing_method: "equal"  # equal or score_weighted
+  factor_ablation_factors:
+   - technical
+   - fundamental
+   - sentiment
+   - relative_strength
+  oos_tuning_profiles:
+   baseline: {}
+   tighter_exits:
+    stop_loss_atr_mult: 1.5
+    take_profit_atr_mult: 2.5
+```
+
+### Illustrative Backtest Output
+
+The values below demonstrate the output format only. They are not a current
+performance claim, investment recommendation, or forecast.
 ```
 BACKTEST RESULTS
 ==================================================

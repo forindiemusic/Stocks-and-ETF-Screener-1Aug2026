@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 # Valid ETF symbol pattern
 VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9._-]{1,10}$')
 
+# Relative-strength inputs reward greater confirmed momentum, accumulation,
+# liquidity participation, trend strength, and volatility expansion. A symbol
+# is only admitted to the candidate universe after its asset-specific score
+# has evaluated price direction; the percentile overlay therefore ranks the
+# strength of the confirmation signals themselves.
+RELATIVE_STRENGTH_HIGHER_IS_BETTER = {
+    'roc_10': True,
+    'obv_trend': True,
+    'atr_trend_ratio': True,
+    'volume_ratio': True,
+    'adx': True,
+}
+
 
 def validate_etf_symbol(symbol: str) -> bool:
     """Validate ETF symbol format."""
@@ -449,12 +462,13 @@ def compute_composite_relative_strength(
     if weights is None:
         weights = {k: 1.0 / len(indicator_sets) for k in indicator_sets}
 
-    # Compute percentile ranks for each indicator
+    # Compute percentile ranks for each indicator. All currently used
+    # relative-strength factors are confirmation signals where higher is
+    # stronger. Unknown factors preserve the conventional higher-is-better
+    # ordering unless a caller supplies pre-transformed values.
     percentiles: Dict[str, Dict[str, float]] = {}
     for name, values in indicator_sets.items():
-        # Determine if lower is better based on indicator name
-        lower_is_better_names = {'atr_trend_ratio', 'volatility_20', 'volume_ratio'}
-        higher_is_better = name not in lower_is_better_names
+        higher_is_better = RELATIVE_STRENGTH_HIGHER_IS_BETTER.get(name, True)
         percentiles[name] = compute_percentile_rank(
             values, name, higher_is_better=higher_is_better
         )

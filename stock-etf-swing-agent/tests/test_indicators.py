@@ -99,6 +99,56 @@ class TestCalculateTechnicalIndicators:
         expected = last_20_returns.std() * np.sqrt(252)
         assert abs(result['volatility_20'] - expected) < 0.01
 
+    def test_vwap_uses_trailing_twenty_sessions(self):
+        """Old bars must not distort the daily rolling VWAP reference."""
+        dates = pd.date_range('2025-01-01', periods=50, freq='B')
+        typical_price = np.full(50, 100.0)
+        typical_price[0] = 1_000.0
+        df = pd.DataFrame({
+            'Open': typical_price,
+            'High': typical_price,
+            'Low': typical_price,
+            'Close': typical_price,
+            'Volume': np.full(50, 1_000_000.0),
+        }, index=dates)
+
+        result = calculate_technical_indicators(df)
+
+        assert result['vwap'] == pytest.approx(100.0)
+        assert result['vwap_distance_pct'] == pytest.approx(0.0)
+
+    def test_rvol_compares_five_prior_matching_weekdays(self):
+        """RVOL uses only the previous five occurrences of today's weekday."""
+        dates = pd.date_range('2025-01-06', periods=51, freq='W-MON')
+        volume = np.full(51, 100.0)
+        volume[-1] = 200.0
+        prices = np.full(51, 100.0)
+        df = pd.DataFrame({
+            'Open': prices,
+            'High': prices + 1,
+            'Low': prices - 1,
+            'Close': prices,
+            'Volume': volume,
+        }, index=dates)
+
+        result = calculate_technical_indicators(df)
+
+        assert result['rvol_5'] == pytest.approx(2.0)
+
+    def test_rvol_is_neutral_without_dated_weekday_history(self):
+        prices = np.full(50, 100.0)
+        df = pd.DataFrame({
+            'Open': prices,
+            'High': prices + 1,
+            'Low': prices - 1,
+            'Close': prices,
+            'Volume': np.full(50, 200.0),
+        })
+
+        result = calculate_technical_indicators(df)
+
+        assert result['rvol_5'] == 1.0
+
     def test_all_values_finite(self, sample_ohlcv_data):
         result = calculate_technical_indicators(sample_ohlcv_data)
         for key, value in result.items():

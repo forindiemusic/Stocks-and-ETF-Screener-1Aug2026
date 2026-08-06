@@ -10,6 +10,8 @@ from scoring import (
     calculate_fundamental_score,
     _compute_tracking_error,
     _compute_sharpe_1y,
+    compute_composite_relative_strength,
+    compute_percentile_rank,
 )
 
 
@@ -112,6 +114,42 @@ class TestCalculateTechnicalScore:
         score_high_adx = calculate_technical_score(base)
 
         assert score_high_adx > score_low_adx
+
+
+class TestRelativeStrengthRanking:
+    """Tests for universe-relative confirmation-factor ranking."""
+
+    def test_percentile_rank_higher_is_better(self):
+        ranks = compute_percentile_rank(
+            {'LOW': 1.0, 'MID': 2.0, 'HIGH': 3.0},
+            'roc_10',
+        )
+
+        assert ranks['HIGH'] == 1.0
+        assert ranks['MID'] == 0.5
+        assert ranks['LOW'] == 0.0
+
+    def test_composite_rewards_volume_and_atr_expansion(self):
+        """Breakout-confirmation factors must not be ranked in reverse."""
+        scores = compute_composite_relative_strength({
+            'atr_trend_ratio': {'WEAK': 0.85, 'MID': 1.00, 'STRONG': 1.25},
+            'volume_ratio': {'WEAK': 0.60, 'MID': 1.00, 'STRONG': 1.80},
+        })
+
+        assert scores['STRONG'] == 1.0
+        assert scores['MID'] == 0.5
+        assert scores['WEAK'] == 0.0
+
+    def test_composite_rewards_consistent_confirmation_strength(self):
+        scores = compute_composite_relative_strength({
+            'roc_10': {'WEAK': -2.0, 'MID': 1.0, 'STRONG': 5.0},
+            'obv_trend': {'WEAK': -0.2, 'MID': 0.1, 'STRONG': 0.6},
+            'atr_trend_ratio': {'WEAK': 0.85, 'MID': 1.0, 'STRONG': 1.25},
+            'volume_ratio': {'WEAK': 0.60, 'MID': 1.00, 'STRONG': 1.80},
+            'adx': {'WEAK': 12.0, 'MID': 25.0, 'STRONG': 40.0},
+        })
+
+        assert scores['STRONG'] > scores['MID'] > scores['WEAK']
 
 
 class TestCalculateFundamentalScore:

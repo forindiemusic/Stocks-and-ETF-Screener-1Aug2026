@@ -611,16 +611,17 @@ class ETFSwingAgent:
             price_change_1w = (valid_close.iloc[-1] / valid_close.iloc[-5] - 1) * 100 if len(valid_close) >= 5 else 0
 
         # Short-term (days-scale) score — computed for stocks in any mode.
-        # Uses SPY 1mo data for relative-strength comparison.
+        # Six months supplies the five prior same-weekday observations needed
+        # for RVOL while the indicators use trailing short lookback windows.
         # Also compute for ETFs to power the 4-week growth outlook.
         short_term_score = 0.0
         day_trade_score = 0.0
         growth_outlook = None
-        short_data = self.fetch_etf_data(symbol, "1mo")
+        short_data = self.fetch_etf_data(symbol, "6mo")
         if short_data is not None and len(short_data) >= 20:
             short_ind = calculate_short_term_indicators(short_data)
-            # Fetch SPY 1mo once for relative strength (cached, so cheap after first call)
-            spy_short = self.fetch_etf_data("SPY", "1mo")
+            # Fetch SPY six-month history once for relative strength and RVOL.
+            spy_short = self.fetch_etf_data("SPY", "6mo")
             spy_ind = calculate_short_term_indicators(spy_short) if spy_short is not None and len(spy_short) >= 20 else None
             if is_stock:
                 short_term_score = calculate_short_term_score(short_ind, spy_indicators=spy_ind)
@@ -635,16 +636,17 @@ class ETFSwingAgent:
                 )
 
         # Day-trade (1-5 day) score — computed when horizon == "day".
-        # Uses ~1 month of data for ultra-short indicators (need 20+ days for SMA20).
+        # Uses six months for RVOL history; individual signals remain
+        # ultra-short because their calculations use trailing daily windows.
         day_trade_score = 0.0
         if self.horizon == "day":
-            day_data = self.fetch_etf_data(symbol, "1mo")
+            day_data = self.fetch_etf_data(symbol, "6mo")
             if day_data is not None and len(day_data) >= 20:
                 # Validate day_data has valid close prices
                 valid_day_close = day_data['Close'].dropna()
                 if not valid_day_close.empty:
                     day_ind = calculate_day_trade_indicators(day_data)
-                    spy_day = self.fetch_etf_data("SPY", "1mo")
+                    spy_day = self.fetch_etf_data("SPY", "6mo")
                     spy_day_ind = calculate_day_trade_indicators(spy_day) if spy_day is not None and len(spy_day) >= 20 else None
                     day_trade_score = calculate_day_trade_score(day_ind, spy_indicators=spy_day_ind)
 

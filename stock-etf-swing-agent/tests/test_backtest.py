@@ -4,6 +4,7 @@ Unit tests for backtest.py
 
 import pytest
 import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 from backtest import ETFBacktester
@@ -32,6 +33,44 @@ class TestETFBacktesterInit:
     def test_default_top_n(self):
         bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
         assert bt.top_n == 5
+
+    def test_default_sentiment_mode_is_off(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        assert bt.sentiment_mode == 'off'
+
+    def test_rejects_unknown_sentiment_mode(self, tmp_path):
+        config_path = tmp_path / 'invalid-sentiment.yaml'
+        config_path.write_text(
+            "etf_universe: [SPY]\n"
+            "technical_weights: {}\n"
+            "fundamental_weights: {}\n"
+            "risk: {}\n"
+            "market_regime: {}\n"
+            "backtest:\n"
+            "  sentiment_mode: live_news\n"
+        )
+
+        with pytest.raises(ValueError, match="sentiment_mode"):
+            ETFBacktester(config_path=str(config_path))
+
+
+class TestBacktestSentimentModes:
+    """Historical sentiment must be explicit and reproducible."""
+
+    def test_off_mode_returns_neutral_without_data_fetch(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        with patch.object(ETFBacktester, 'fetch_historical_data') as fetch:
+            assert bt.get_sentiment_score('SPY', datetime.now()) == 0.5
+        fetch.assert_not_called()
+
+    def test_price_proxy_mode_uses_historical_price_data(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        bt.sentiment_mode = 'price_proxy'
+        dates = pd.date_range('2025-01-01', periods=5, freq='B')
+        data = pd.DataFrame({'Close': [100.0, 100.0, 100.0, 100.0, 105.0]}, index=dates)
+
+        with patch.object(ETFBacktester, 'fetch_historical_data', return_value=data):
+            assert bt.get_sentiment_score('SPY', dates[-1].to_pydatetime()) == 1.0
 
 
 class TestTurnoverCost:
@@ -197,10 +236,109 @@ class TestWalkForward:
                 'mean_sharpe', 'mean_sortino', 'mean_max_drawdown',
                 'worst_drawdown', 'mean_information_ratio', 'mean_win_rate',
                 'beat_benchmark_pct', 'pct_profitable_windows',
-                'mean_excess_return', 'windows',
+                'mean_excess_return', 'windows', 'regime_performance',
             }
             for key in agg_keys:
                 assert key in result, f"Missing aggregated key: {key}"
+
+    def test_regime_summary_groups_realized_periods(self):
+        summary = ETFBacktester._summarize_regime_performance([
+            {'portfolio_history': [
+                {'market_regime': 'bull', 'period_return': 0.02, 'benchmark_return': 0.01},
+                {'market_regime': 'bull', 'period_return': -0.01, 'benchmark_return': 0.00},
+                {'market_regime': 'bear', 'period_return': -0.03, 'benchmark_return': -0.04},
+            ]},
+        ])
+
+        assert summary['bull']['periods'] == 2.0
+        assert summary['bull']['mean_strategy_return'] == pytest.approx(0.005)
+        assert summary['bull']['mean_excess_return'] == pytest.approx(0.0)
+        assert summary['bear']['mean_excess_return'] == pytest.approx(0.01)
+
+
+class TestFactorAblation:
+    """Factor ablation compares frozen strategy modules without re-optimization."""
+
+    def test_ablation_reports_each_configured_factor_and_restores_state(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        calls = []
+
+        def fake_walk_forward(*args, **kwargs):
+            calls.append(set(bt._ablated_factors))
+            is_baseline = not bt._ablated_factors
+            return {
+                'mean_annual_return': 0.12 if is_baseline else 0.10,
+                'mean_sharpe': 1.20 if is_baseline else 1.00,
+                'portfolio_history': [],
+            }
+
+        with patch.object(ETFBacktester, 'run_walk_forward', side_effect=fake_walk_forward):
+            result = bt.run_factor_ablation(
+                datetime(2024, 1, 1), datetime(2025, 1, 1),
+                factors=['technical', 'relative_strength'],
+            )
+
+        assert calls == [set(), {'technical'}, {'relative_strength'}]
+        assert result['comparison']['without_technical']['return_delta_vs_baseline'] == pytest.approx(-0.02)
+        assert result['comparison']['without_relative_strength']['sharpe_delta_vs_baseline'] == pytest.approx(-0.20)
+        assert bt._ablated_factors == set()
+
+
+class TestOutOfSampleTuning:
+    """Candidate settings must be selected before untouched test evaluation."""
+
+    def test_selects_training_winner_then_evaluates_once_on_test(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        calls = []
+        train_start = datetime(2022, 1, 1)
+        train_end = datetime(2023, 1, 1)
+        test_start = datetime(2023, 1, 2)
+        test_end = datetime(2024, 1, 1)
+
+        def fake_backtest(start, end, _frequency):
+            calls.append((start, end, bt.stop_loss_atr_mult))
+            if start == train_start:
+                sharpe = 0.5 if bt.stop_loss_atr_mult == 1.5 else 1.0
+                return {'strategy_sharpe_ratio': sharpe, 'strategy_annual_return': sharpe / 10}
+            return {'strategy_sharpe_ratio': 0.7, 'strategy_annual_return': 0.08}
+
+        profiles = {
+            'loose': {'stop_loss_atr_mult': 2.5},
+            'tight': {'stop_loss_atr_mult': 1.5},
+        }
+        with patch.object(ETFBacktester, 'run_backtest', side_effect=fake_backtest):
+            result = bt.run_out_of_sample_tuning(
+                train_start, train_end, test_start, test_end, profiles=profiles
+            )
+
+        assert result['selected_profile'] == 'loose'
+        assert calls == [
+            (train_start, train_end, 2.5),
+            (train_start, train_end, 1.5),
+            (test_start, test_end, 2.5),
+        ]
+        assert bt.stop_loss_atr_mult == 2.0
+
+    def test_rejects_overlapping_train_and_test_periods(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        result = bt.run_out_of_sample_tuning(
+            datetime(2023, 1, 1), datetime(2023, 6, 1),
+            datetime(2023, 6, 1), datetime(2024, 1, 1),
+            profiles={'baseline': {}},
+        )
+
+        assert 'error' in result
+
+    def test_score_weighted_position_sizing_uses_rank_scores(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        bt.position_sizing_method = 'score_weighted'
+        bt.risk_config['max_position_pct'] = 1.0
+        positions = [{'_rank_score': 0.8}, {'_rank_score': 0.2}]
+
+        bt._apply_position_sizing(positions)
+
+        assert positions[0]['position_pct'] == pytest.approx(0.8)
+        assert positions[1]['position_pct'] == pytest.approx(0.2)
 
 
 class TestBacktestGrowthPrimary:
@@ -281,6 +419,41 @@ class TestBacktestGrowthPrimary:
             'growth_scores': [e.get('growth_outlook', {}).get('growth_score', 0.0) for e in selected],
         }
         assert history_entry['growth_scores'] == [0.75]
+
+
+class TestNextSessionExecution:
+    """Signals formed at a close must execute no earlier than next open."""
+
+    def test_next_session_entry_uses_first_post_signal_open(self):
+        bt = ETFBacktester(etf_universe=['SPY'], lookback_months=3)
+        dates = pd.to_datetime(['2025-01-02', '2025-01-03', '2025-01-06'])
+        data = pd.DataFrame({
+            'Open': [100.0, 110.0, 115.0],
+            'High': [101.0, 112.0, 116.0],
+            'Low': [99.0, 109.0, 114.0],
+            'Close': [100.0, 111.0, 115.0],
+            'Volume': [1_000_000.0] * 3,
+        }, index=dates)
+
+        with patch.object(ETFBacktester, 'fetch_period_data', return_value=data):
+            entry = bt._get_next_session_entry(
+                'SPY', dates[0].to_pydatetime(), dates[-1].to_pydatetime()
+            )
+
+        assert entry is not None
+        entry_price, entry_date = entry
+        assert entry_price == 110.0
+        assert entry_date.date() == dates[1].date()
+
+    def test_holding_window_excludes_signal_date(self):
+        dates = pd.to_datetime(['2025-01-02', '2025-01-03', '2025-01-06'])
+        data = pd.DataFrame({'Close': [100.0, 110.0, 115.0]}, index=dates)
+
+        window = ETFBacktester._filter_holding_window(
+            data, dates[0].to_pydatetime(), dates[-1].to_pydatetime()
+        )
+
+        assert list(window.index) == list(dates[1:])
 
 
 class TestYieldLabel:

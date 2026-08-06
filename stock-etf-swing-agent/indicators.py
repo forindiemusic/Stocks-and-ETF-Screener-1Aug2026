@@ -13,6 +13,47 @@ import talib
 from typing import Dict, Optional
 
 
+def _calculate_rolling_vwap(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    volume: pd.Series,
+    window: int = 20,
+) -> float:
+    """Return a trailing daily VWAP-style reference over ``window`` sessions.
+
+    True VWAP resets each trading session and requires intraday bars. The
+    screener uses daily OHLCV data, so this rolling calculation is deliberately
+    a 20-session volume-weighted price reference rather than a session VWAP.
+    """
+    typical_price = (high + low + close) / 3
+    numerator = (typical_price * volume).rolling(window).sum().iloc[-1]
+    denominator = volume.rolling(window).sum().iloc[-1]
+    return float(numerator / denominator) if denominator > 0 else float(close.iloc[-1])
+
+
+def _calculate_same_weekday_rvol(volume: pd.Series, lookback_weeks: int = 5) -> float:
+    """Compare current volume with the prior ``lookback_weeks`` same weekdays.
+
+    The calculation needs the current occurrence plus five prior occurrences,
+    which means roughly six months of daily history is fetched by callers.
+    A neutral 1.0 is returned whenever a dated five-week comparison is not
+    available.
+    """
+    if not isinstance(volume.index, pd.DatetimeIndex):
+        return 1.0
+
+    current_weekday = volume.index[-1].weekday()
+    same_weekday = volume[volume.index.weekday == current_weekday]
+    previous = same_weekday.iloc[:-1].tail(lookback_weeks)
+    if len(previous) < lookback_weeks:
+        return 1.0
+
+    baseline = previous.mean()
+    value = volume.iloc[-1] / baseline if baseline > 0 else 1.0
+    return float(value) if np.isfinite(value) else 1.0
+
+
 def calculate_technical_indicators(data: pd.DataFrame) -> Dict[str, float]:
     """Calculate technical indicators for scoring."""
     if data is None or len(data) < 50:
@@ -91,10 +132,10 @@ def calculate_technical_indicators(data: pd.DataFrame) -> Dict[str, float]:
     indicators['volume_sma_20'] = volume_series.rolling(20).mean().iloc[-1]
     indicators['volume_ratio'] = volume_series.iloc[-1] / indicators['volume_sma_20'] if indicators['volume_sma_20'] > 0 else 1
 
-    # --- VWAP (Volume-Weighted Average Price) ---
-    typical_price = (data['High'] + data['Low'] + data['Close']) / 3
-    vwap = (typical_price * volume_series).cumsum() / volume_series.cumsum()
-    indicators['vwap'] = float(vwap.iloc[-1])
+    # --- Rolling 20-session VWAP-style reference ---
+    indicators['vwap'] = _calculate_rolling_vwap(
+        data['High'], data['Low'], data['Close'], volume_series
+    )
     indicators['vwap_distance_pct'] = float((indicators['price'] / indicators['vwap'] - 1) * 100) if indicators['vwap'] > 0 else 0.0
 
     # --- Chaikin Money Flow (CMF) over 20 days ---
@@ -105,21 +146,8 @@ def calculate_technical_indicators(data: pd.DataFrame) -> Dict[str, float]:
     cmf_20 = mfv.rolling(20).sum() / volume_series.rolling(20).sum()
     indicators['cmf_20'] = float(cmf_20.iloc[-1]) if not np.isnan(cmf_20.iloc[-1]) else 0.0
 
-    # --- Relative Volume (RVOL) — today's volume vs same-weekday avg over 5 weeks ---
-    if len(volume_series) >= 25 and isinstance(volume_series.index, pd.DatetimeIndex):
-        weekday = volume_series.index[-1].weekday()
-        same_weekday_mask = volume_series.index.weekday == weekday
-        same_weekday_vol = volume_series[same_weekday_mask]
-        if len(same_weekday_vol) > 1:
-            if len(same_weekday_vol) > 5:
-                rvol_5 = volume_series.iloc[-1] / same_weekday_vol.iloc[:-1].iloc[-5:].mean()
-            else:
-                rvol_5 = volume_series.iloc[-1] / same_weekday_vol.iloc[:-1].mean()
-            indicators['rvol_5'] = float(rvol_5) if rvol_5 == rvol_5 else 1.0
-        else:
-            indicators['rvol_5'] = 1.0
-    else:
-        indicators['rvol_5'] = 1.0
+    # --- Relative volume: current vs the five prior matching weekdays ---
+    indicators['rvol_5'] = _calculate_same_weekday_rvol(volume_series)
 
     # --- ATR (TA-Lib — uses Wilder's smoothing) ---
     atr = talib.ATR(high, low, close, timeperiod=14)  # type: ignore[arg-type]
@@ -216,11 +244,10 @@ def calculate_short_term_indicators(data: pd.DataFrame) -> Dict[str, float]:
     vol_sma20 = float(volume_series.rolling(20).mean().iloc[-1])
     ind['volume_ratio_3d'] = float(volume[-3:].mean() / vol_sma20) if vol_sma20 > 0 else 1.0  # type: ignore[union-attr]
 
-    # --- VWAP (Volume-Weighted Average Price) ---
-    # Standard intraday reference. Using daily data: VWAP = cum(price*vol)/cum(vol)
-    typical_price = (data['High'] + data['Low'] + data['Close']) / 3
-    vwap = (typical_price * volume_series).cumsum() / volume_series.cumsum()
-    ind['vwap'] = float(vwap.iloc[-1])
+    # --- Rolling 20-session VWAP-style reference ---
+    ind['vwap'] = _calculate_rolling_vwap(
+        data['High'], data['Low'], data['Close'], volume_series
+    )
     ind['vwap_distance_pct'] = float((ind['price'] / ind['vwap'] - 1) * 100) if ind['vwap'] > 0 else 0.0
 
     # --- Chaikin Money Flow (CMF) over 20 days ---
@@ -233,22 +260,8 @@ def calculate_short_term_indicators(data: pd.DataFrame) -> Dict[str, float]:
     cmf_20 = mfv.rolling(20).sum() / volume_series.rolling(20).sum()
     ind['cmf_20'] = float(cmf_20.iloc[-1]) if not np.isnan(cmf_20.iloc[-1]) else 0.0
 
-    # --- Relative Volume (RVOL) — today's volume vs same-weekday avg over 5 weeks ---
-    # More nuanced than raw volume ratio: accounts for day-of-week patterns
-    if len(volume_series) >= 25 and isinstance(volume_series.index, pd.DatetimeIndex):
-        weekday = volume_series.index[-1].weekday()
-        same_weekday_mask = volume_series.index.weekday == weekday
-        same_weekday_vol = volume_series[same_weekday_mask]
-        if len(same_weekday_vol) > 1:
-            if len(same_weekday_vol) > 5:
-                rvol_5 = volume_series.iloc[-1] / same_weekday_vol.iloc[:-1].iloc[-5:].mean()
-            else:
-                rvol_5 = volume_series.iloc[-1] / same_weekday_vol.iloc[:-1].mean()
-            ind['rvol_5'] = float(rvol_5) if rvol_5 == rvol_5 else 1.0
-        else:
-            ind['rvol_5'] = 1.0
-    else:
-        ind['rvol_5'] = 1.0
+    # --- Relative volume: current vs the five prior matching weekdays ---
+    ind['rvol_5'] = _calculate_same_weekday_rvol(volume_series)
 
     # Short ATR (5) for day-scale volatility
     atr5 = talib.ATR(high, low, close, timeperiod=5)  # type: ignore[arg-type]
@@ -363,10 +376,10 @@ def calculate_day_trade_indicators(data: pd.DataFrame) -> Dict[str, float]:
     # --- Intraday volatility (today's range / close) ---
     ind['intraday_range_pct'] = float((high_series.iloc[-1] - low_series.iloc[-1]) / close_series.iloc[-1] * 100)
 
-    # --- VWAP (Volume-Weighted Average Price) ---
-    typical_price = (high_series + low_series + close_series) / 3
-    vwap = (typical_price * volume_series).cumsum() / volume_series.cumsum()
-    ind['vwap'] = float(vwap.iloc[-1])
+    # --- Rolling 20-session VWAP-style reference ---
+    ind['vwap'] = _calculate_rolling_vwap(
+        high_series, low_series, close_series, volume_series
+    )
     ind['vwap_distance_pct'] = float((ind['price'] / ind['vwap'] - 1) * 100) if ind['vwap'] > 0 else 0.0
 
     # --- Chaikin Money Flow (CMF) over 20 days ---
@@ -377,21 +390,8 @@ def calculate_day_trade_indicators(data: pd.DataFrame) -> Dict[str, float]:
     cmf_20 = mfv.rolling(20).sum() / volume_series.rolling(20).sum()
     ind['cmf_20'] = float(cmf_20.iloc[-1]) if not np.isnan(cmf_20.iloc[-1]) else 0.0
 
-    # --- Relative Volume (RVOL) — today's volume vs same-weekday avg over 5 weeks ---
-    if len(volume_series) >= 25 and isinstance(volume_series.index, pd.DatetimeIndex):
-        weekday = volume_series.index[-1].weekday()
-        same_weekday_mask = volume_series.index.weekday == weekday
-        same_weekday_vol = volume_series[same_weekday_mask]
-        if len(same_weekday_vol) > 1:
-            if len(same_weekday_vol) > 5:
-                rvol_5 = volume_series.iloc[-1] / same_weekday_vol.iloc[:-1].iloc[-5:].mean()
-            else:
-                rvol_5 = volume_series.iloc[-1] / same_weekday_vol.iloc[:-1].mean()
-            ind['rvol_5'] = float(rvol_5) if rvol_5 == rvol_5 else 1.0
-        else:
-            ind['rvol_5'] = 1.0
-    else:
-        ind['rvol_5'] = 1.0
+    # --- Relative volume: current vs the five prior matching weekdays ---
+    ind['rvol_5'] = _calculate_same_weekday_rvol(volume_series)
 
     # --- ATR(2) for 1-2 day volatility ---
     atr2 = talib.ATR(high, low, close, timeperiod=2)  # type: ignore[arg-type]

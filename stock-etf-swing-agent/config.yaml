@@ -177,6 +177,32 @@ composite_weights:
 
 # Backtesting Configuration
 backtest:
+  # Historical current-news sentiment cannot be reproduced. Use 'off' for a
+  # neutral 0.5 contribution or 'price_proxy' for an explicit price-momentum
+  # experiment (which can overlap technical momentum signals).
+  sentiment_mode: "off"
+  # Modules neutralized one at a time by run_factor_ablation(). This reports
+  # walk-forward deltas; it does not tune or optimize strategy weights.
+  factor_ablation_factors:
+    - technical
+    - fundamental
+    - sentiment
+    - relative_strength
+  # Effective controls used by the backtester. ``min_rank_score`` is applied
+  # before correlation filtering; equal sizing is the conservative baseline.
+  min_rank_score: 0.0
+  position_sizing_method: "equal"
+  # Candidate profiles for run_out_of_sample_tuning(). Select only on the
+  # training range, then evaluate the selected profile once on untouched data.
+  oos_tuning_profiles:
+    baseline: {}
+    tighter_exits:
+      stop_loss_atr_mult: 1.5
+      take_profit_atr_mult: 2.5
+    score_weighted:
+      position_sizing_method: "score_weighted"
+    higher_quality:
+      min_rank_score: 0.50
   # Transaction costs (applied per rebalance on turnover)
   commission_per_share: 0.0      # Per-share commission ($0 for most modern brokers)
   slippage_bps: 5.0              # Slippage in basis points (0.05% = 5 bps)
